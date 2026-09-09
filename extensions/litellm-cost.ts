@@ -38,15 +38,33 @@ export default function (pi: ExtensionAPI) {
   // Store the latest response cost header (keyed by a transient request marker)
   let lastResponseCost: number | null = null;
 
-  // Fetch model pricing from the gateway at startup
+  // Fetch model pricing from the gateway at startup. A single transient
+  // network hiccup during Pi's own startup window (DNS/socket not warm yet,
+  // gateway briefly busy) shouldn't surface a scary warning, so retry once
+  // after a short delay before giving up. Each attempt has its own timeout
+  // so a hung connection doesn't block Pi's startup indefinitely.
+  async function fetchModelInfoOnce(): Promise<Response> {
+    return fetch(`${BASE_URL}/model/info`, {
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        Accept: "application/json",
+      },
+      signal: AbortSignal.timeout(8000),
+    });
+  }
+
   pi.on("session_start", async (_event, ctx) => {
     try {
-      const response = await fetch(`${BASE_URL}/model/info`, {
-        headers: {
-          Authorization: `Bearer ${API_KEY}`,
-          Accept: "application/json",
-        },
-      });
+      let response: Response;
+      try {
+        response = await fetchModelInfoOnce();
+      } catch {
+        // First attempt failed (timeout, DNS not ready yet, connection reset
+        // during startup, etc.) — wait briefly and retry once before
+        // reporting a warning to the user.
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+        response = await fetchModelInfoOnce();
+      }
 
       if (!response.ok) {
         ctx.ui.notify(
@@ -96,9 +114,11 @@ export default function (pi: ExtensionAPI) {
         );
       }
     } catch (err: any) {
-      // Non-fatal: extension still works if header is available
+      // Non-fatal even after the retry: per-request cost still works via
+      // the x-litellm-response-cost header, this only affects the
+      // startup pricing pre-load used for streaming fallback.
       ctx.ui.notify(
-        `ollama-mke cost extension: could not fetch /model/info (${err.message})`,
+        `ollama-mke cost extension: could not fetch /model/info after retry (${err.message})`,
         "warning"
       );
     }
