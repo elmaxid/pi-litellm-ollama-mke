@@ -32,10 +32,10 @@ When either credential flag is omitted, the CLI prompts interactively. Restart P
 pi install git:github.com/elmaxid/pi-litellm-ollama-mke
 ```
 
-Configure `providers["ollama-mke"]` manually in `~/.pi/agent/models.json` as shown below, or run the installer from an installed package:
+Configure `providers["ollama-mke"]` manually in `~/.pi/agent/models.json` as shown below, or run the installer from the installed package. `pi install` for a `git:` source clones it under `~/.pi/agent/git/<host>/<path>` (user scope) or `.pi/git/<host>/<path>` (project scope) — not `node_modules/`, which is npm-only:
 
 ```sh
-node node_modules/pi-litellm-ollama-mke/bin/setup.mjs
+node ~/.pi/agent/git/github.com/elmaxid/pi-litellm-ollama-mke/bin/setup.mjs
 ```
 
 ## Setup CLI flags
