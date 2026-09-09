@@ -1,0 +1,26 @@
+{
+  "name": "pi-litellm-ollama-mke",
+  "version": "0.1.0",
+  "description": "Pi provider integration for our internal ollama-mke LiteLLM gateway — dynamic model sync, accurate cost tracking, session grouping, and a guided setup CLI. Fork of xec-abailey/pi-litellm.",
+  "keywords": [
+    "pi-package",
+    "litellm",
+    "ollama",
+    "cost-tracking",
+    "session-grouping",
+    "model-sync"
+  ],
+  "license": "MIT",
+  "author": "mke",
+  "bin": {
+    "pi-litellm-ollama-mke": "./bin/setup.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}
