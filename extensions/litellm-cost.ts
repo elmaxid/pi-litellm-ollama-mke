@@ -12,12 +12,18 @@
  *
  * Fork of https://github.com/xec-abailey/pi-litellm (extensions/litellm-cost.ts).
  *
- * Configuration:
- *   Set OLLAMA_MKE_BASE_URL env var to the gateway URL (default: http://localhost:4000)
- *   Set OLLAMA_MKE_API_KEY env var if the gateway requires auth (default: sk-cedar-local)
- *   Legacy LITELLM_BASE_URL / LITELLM_API_KEY are read as a fallback.
+ * Configuration resolution (same priority and source as litellm-sync.ts, so
+ * the two extensions never disagree about which gateway they are talking to):
+ *   1. OLLAMA_MKE_BASE_URL / OLLAMA_MKE_API_KEY env vars
+ *   2. Legacy LITELLM_BASE_URL / LITELLM_API_KEY env vars
+ *   3. providers["ollama-mke"] in ~/.pi/agent/models.json
+ *   4. Legacy providers.litellm in ~/.pi/agent/models.json
+ *   5. Defaults (http://localhost:4000, sk-cedar-local)
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { readFileSync, existsSync } from "node:fs";
+import { join } from "node:path";
+import { homedir } from "node:os";
 
 interface ModelCostInfo {
   inputCostPerToken: number;
@@ -26,11 +32,47 @@ interface ModelCostInfo {
   cacheWriteCostPerToken: number;
 }
 
+/**
+ * Resolve the gateway base URL and API key using the exact same priority and
+ * models.json shape as litellm-sync.ts. Kept local (rather than imported)
+ * because pi loads each extension file independently with no shared module
+ * resolution between them.
+ */
+function resolveGatewayConfig(): { baseUrl: string; apiKey: string } {
+  const defaults = { baseUrl: "http://localhost:4000", apiKey: "sk-cedar-local" };
+
+  let fromModelsJson: { baseUrl?: string; apiKey?: string } = {};
+  const modelsJsonPath = join(homedir(), ".pi", "agent", "models.json");
+  if (existsSync(modelsJsonPath)) {
+    try {
+      const raw = readFileSync(modelsJsonPath, "utf-8");
+      const stripped = raw
+        .replace(/"(?:\\.|[^"\\])*"|\/\/[^\n]*/g, (m) => (m[0] === '"' ? m : ""))
+        .replace(/"(?:\\.|[^"\\])*"|,(\s*[}\]])/g, (m, tail) => tail ?? (m[0] === '"' ? m : ""));
+      const parsed = JSON.parse(stripped) as { providers?: Record<string, any> };
+      const p = parsed?.providers?.["ollama-mke"] ?? parsed?.providers?.litellm ?? {};
+      fromModelsJson = { baseUrl: p.baseUrl, apiKey: p.apiKey };
+    } catch {
+      // Ignore parse errors — fall through to defaults, same as litellm-sync.ts.
+    }
+  }
+
+  return {
+    baseUrl:
+      process.env.OLLAMA_MKE_BASE_URL ??
+      process.env.LITELLM_BASE_URL ??
+      fromModelsJson.baseUrl ??
+      defaults.baseUrl,
+    apiKey:
+      process.env.OLLAMA_MKE_API_KEY ??
+      process.env.LITELLM_API_KEY ??
+      fromModelsJson.apiKey ??
+      defaults.apiKey,
+  };
+}
+
 export default function (pi: ExtensionAPI) {
-  const BASE_URL =
-    process.env.OLLAMA_MKE_BASE_URL || process.env.LITELLM_BASE_URL || "http://localhost:4000";
-  const API_KEY =
-    process.env.OLLAMA_MKE_API_KEY || process.env.LITELLM_API_KEY || "sk-cedar-local";
+  const { baseUrl: BASE_URL, apiKey: API_KEY } = resolveGatewayConfig();
 
   // Store per-model cost info from /model/info
   const modelCosts = new Map<string, ModelCostInfo>();
