@@ -117,8 +117,21 @@ export default function (pi: ExtensionAPI) {
       // Non-fatal even after the retry: per-request cost still works via
       // the x-litellm-response-cost header, this only affects the
       // startup pricing pre-load used for streaming fallback.
+      //
+      // Node's fetch (undici) reports a generic message like "fetch failed"
+      // at err.message and puts the real underlying cause (ECONNREFUSED,
+      // ENOTFOUND, TLS error, socket timeout, etc.) at err.cause. Surface
+      // both, plus the exact URL, so a real outage is diagnosable from this
+      // one notify line instead of a bare "fetch failed".
+      const cause =
+        err?.cause instanceof Error
+          ? err.cause.message
+          : err?.cause != null
+          ? String(err.cause)
+          : undefined;
       ctx.ui.notify(
-        `ollama-mke cost extension: could not fetch /model/info after retry (${err.message})`,
+        `ollama-mke cost extension: could not fetch ${BASE_URL}/model/info after retry (${err.message}` +
+          `${cause ? ` — cause: ${cause}` : ""})`,
         "warning"
       );
     }

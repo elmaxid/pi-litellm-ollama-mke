@@ -252,8 +252,16 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
     const payload = (await res.json()) as LiteLLMModelsResponse;
     models = payload.data ?? [];
   } catch (err) {
+    // Node's fetch (undici) reports a generic message like "fetch failed" at
+    // err.message and puts the real underlying cause (ECONNREFUSED,
+    // ENOTFOUND, TLS error, socket timeout, etc.) at err.cause. Surface both
+    // so a real, persistent outage is diagnosable from this one log line.
+    const cause =
+      err instanceof Error && err.cause instanceof Error
+        ? ` — cause: ${err.cause.message}`
+        : "";
     console.error(
-      `[ollama-mke-sync] Failed to fetch models from ${config.baseUrl}: ${err instanceof Error ? err.message : err}`
+      `[ollama-mke-sync] Failed to fetch models from ${config.baseUrl}: ${err instanceof Error ? err.message : err}${cause}`
     );
     return;
   }
