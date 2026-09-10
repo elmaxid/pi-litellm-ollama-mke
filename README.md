@@ -15,6 +15,7 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 - **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides.
 - **Cost Tracking** — Uses the gateway's `x-litellm-response-cost` header or `/model/info` pricing to replace Pi's static cost calculation for `ollama-mke` requests.
 - **Session Grouping** — Adds `litellm_session_id` to outbound requests so calls from one Pi session are grouped in LiteLLM gateway logs.
+- **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by the gateway's real pricing and capability data.
 
 ## Installation
 
@@ -67,6 +68,19 @@ The extensions resolve settings in this priority: primary environment variables,
 | `LITELLM_API_KEY` | — | Legacy fallback for `OLLAMA_MKE_API_KEY`. |
 
 Example `~/.pi/agent/models.json` configuration:
+
+### `/roles` — role model & effort TUI
+
+Running `/roles` inside Pi opens a menu-driven editor for `~/.pi/agent/subagents.json`, the file gentle-pi and Pi subagents use for per-role model routing (`model_profiles`, `default_model`, `default_effort`).
+
+What it can do:
+
+- **View / edit roles** — lists every discovered role (agent `.md` definitions plus existing `model_profiles` entries) with its *effective* model and effort, and where the value comes from: `model_profiles` beat agent frontmatter, which beats the defaults.
+- **Change a role's model or effort** — pick from the live gateway catalog (marked with `[R]` for reasoning support and per-million input cost); efforts span `off, minimal, low, medium, high, xhigh`. A role's profile can also be cleared so it inherits again.
+- **Defaults** — edit `default_model` and `default_effort`.
+- **Apply preset** — `cheap`, `balanced`, or `quality` reassigns every role at once. The preset picks real models from the gateway's `/model/info` pricing (15th/50th/90th cost percentile), requires a reasoning-capable model for deep roles (proposal, design, verify, review…), lightens roles like sync/archive/status, and clamps the requested effort to what the chosen model actually supports (`supports_*_reasoning_effort`).
+
+Every write shows a summary first, creates a timestamped `subagents.json.bak-*` backup, and preserves any unknown keys already in the file. Changes apply to agents launched afterwards.
 
 ```json
 {
