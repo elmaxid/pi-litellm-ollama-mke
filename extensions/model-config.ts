@@ -210,7 +210,9 @@ function discoverAgentDefinitions(cwd: string): Map<string, AgentDefinitionInfo>
     let files: string[];
     try {
       files = readdirSync(dir).filter((f) => f.toLowerCase().endsWith(".md")).sort();
-    } catch {
+    } catch (err) {
+      // Unreadable directory — warn so roles vanishing from the view is diagnosable.
+      console.warn(`[ollama-mke-roles] cannot list ${dir}: ${err instanceof Error ? err.message : err}`);
       continue;
     }
     for (const file of files) {
@@ -227,8 +229,10 @@ function discoverAgentDefinitions(cwd: string): Map<string, AgentDefinitionInfo>
             ? (rawThinking as ThinkingLevel)
             : undefined,
         });
-      } catch {
-        // Unreadable definition — skip it; the role may still appear via model_profiles.
+      } catch (err) {
+        // Unreadable definition — skip it, but say so: the role may still
+        // appear via model_profiles, yet silently losing it hides drift.
+        console.warn(`[ollama-mke-roles] skipping unreadable agent definition ${join(dir, file)}: ${err instanceof Error ? err.message : err}`);
       }
     }
   }
@@ -564,9 +568,18 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
             (p) =>
               `${p.role} [${p.roleClass}] → ${p.model} · ${p.effort}${p.clampedFrom ? ` (clamped from ${p.clampedFrom})` : ""}`
           );
+          // Surface the two silent-quality cases of percentile picking.
+          const notes: string[] = [];
+          const deepPlan = plan.find((p) => p.roleClass === "deep");
+          if (deepPlan && catalog.find((m) => m.id === deepPlan.model)?.reasoning === false) {
+            notes.push("note: no reasoning-capable model at this price tier — deep roles will run without reasoning.");
+          }
+          if (plan.length > 1 && new Set(plan.map((p) => p.model)).size === 1) {
+            notes.push("note: every class resolved to the same model (small catalog or uniform pricing).");
+          }
           const approved = await ui.confirm(
             `Apply preset "${preset}"?`,
-            `${lines.join("\n")}\n\nThis rewrites model_profiles for all ${plan.length} roles.`
+            `${notes.length ? notes.join("\n") + "\n\n" : ""}${lines.join("\n")}\n\nThis rewrites model_profiles for all ${plan.length} roles.`
           );
           if (!approved) continue;
           if (!(await confirmWrite(ui, `Preset "${preset}": ${plan.length} roles updated.`))) continue;
