@@ -94,6 +94,17 @@ The model-sync extension accepts per-model overrides at `providers["ollama-mke"]
 }
 ```
 
+## Seeing only ollama-mke in `/model` or `--list-models`
+
+Pi ships several **built-in** providers (OpenAI, Anthropic, OpenRouter, Google, etc. — not packages, they come with the Pi binary) that activate automatically whenever Pi detects the matching credential environment variable, regardless of this package. If you only want to see `ollama-mke`, make sure none of these are set in your shell (check with `env | grep -E "_API_KEY|_TOKEN"`):
+
+- `OPENAI_API_KEY` / `OPENAI_BASE_URL` → activates the built-in `openai` provider
+- `OPENROUTER_API_KEY` → activates the built-in `openrouter` provider
+- `ANTHROPIC_API_KEY` → activates the built-in `anthropic` provider
+- `GEMINI_API_KEY` / `GOOGLE_API_KEY` → activates the built-in `google` provider
+
+Comment out or remove those exports from `~/.bashrc` (or wherever your shell sets them) if they are not otherwise needed, then open a **new** shell — an already-running shell keeps the environment variables it loaded at startup, so editing the dotfile alone will not affect a session already open. This is unrelated to `providers["ollama-mke"]` in `models.json`, which only ever adds the `ollama-mke` provider and never removes another one.
+
 ## Local Extension Development
 
 Clone this repository to the expected local path:
