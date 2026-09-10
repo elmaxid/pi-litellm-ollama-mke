@@ -18,25 +18,31 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 
 ## Installation
 
-### Quick guided setup
+### Guided setup (recommended)
 
-```sh
-npx pi-litellm-ollama-mke --base-url http://<gateway-host>:4000 --api-key <key>
-```
-
-When either credential flag is omitted, the CLI prompts interactively. Restart Pi or run `/reload` after setup.
-
-### Manual installation
+This repository is installed from Git, not npm. Install it first:
 
 ```sh
 pi install git:github.com/elmaxid/pi-litellm-ollama-mke
 ```
 
-Configure `providers["ollama-mke"]` manually in `~/.pi/agent/models.json` as shown below, or run the installer from the installed package. `pi install` for a `git:` source clones it under `~/.pi/agent/git/<host>/<path>` (user scope) or `.pi/git/<host>/<path>` (project scope) — not `node_modules/`, which is npm-only:
+Then run its guided setup CLI. A `git:` package is cloned by Pi under `~/.pi/agent/git/<host>/<path>` for a user installation (or `.pi/git/<host>/<path>` for a project installation) — it does **not** live under `node_modules/`.
+
+```sh
+node ~/.pi/agent/git/github.com/elmaxid/pi-litellm-ollama-mke/bin/setup.mjs \
+  --base-url http://<gateway-host>:4000 \
+  --api-key <gateway-api-key>
+```
+
+You can omit either credential flag to be prompted interactively:
 
 ```sh
 node ~/.pi/agent/git/github.com/elmaxid/pi-litellm-ollama-mke/bin/setup.mjs
 ```
+
+The CLI validates `GET /v1/models`, previews the discovered models and configuration (with the API key masked), asks for confirmation, then writes `providers["ollama-mke"]` to `~/.pi/agent/models.json`. It backs up every configuration file before writing.
+
+Restart Pi or run `/reload` after setup. Use `/model` to select one of the discovered `ollama-mke` models for the session.
 
 ## Setup CLI flags
 
