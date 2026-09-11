@@ -43,13 +43,24 @@ interface LiteLLMModelsResponse {
   object: string;
 }
 
+/** model_info sub-object of GET /model/info entries. */
+interface LiteLLMModelInfo {
+  max_input_tokens?: number | null;
+  max_output_tokens?: number | null;
+  supports_reasoning?: boolean | null;
+  supports_none_reasoning_effort?: boolean | null;
+  supports_minimal_reasoning_effort?: boolean | null;
+  supports_low_reasoning_effort?: boolean | null;
+  supports_medium_reasoning_effort?: boolean | null;
+  supports_high_reasoning_effort?: boolean | null;
+  supports_xhigh_reasoning_effort?: boolean | null;
+  supports_max_reasoning_effort?: boolean | null;
+}
+
 /** Shape of GET /model/info (LiteLLM admin endpoint, also used by litellm-cost.ts). */
 interface LiteLLMModelInfoEntry {
   model_name: string;
-  model_info?: {
-    max_input_tokens?: number | null;
-    max_output_tokens?: number | null;
-  } | null;
+  model_info?: LiteLLMModelInfo | null;
 }
 
 interface LiteLLMModelInfoResponse {
@@ -61,6 +72,27 @@ interface ModelOverride {
   contextWindow?: number;
   maxTokens?: number;
   reasoning?: boolean;
+  /** Map pi thinking levels to provider values; null marks a level unsupported. */
+  thinkingLevelMap?: Record<string, string | null>;
+}
+
+/** Pi thinking levels this extension knows about (order: lowest -> highest). */
+type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh";
+
+/**
+ * Capability facts confirmed by the gateway (/model/info). Effort flags use
+ * three states: true/false mean LiteLLM explicitly confirms/denies the level;
+ * null/undefined (absent) mean the gateway does not publish a decision — the
+ * model gets the provider's default mapping for standard levels, and no
+ * unsupported-level claim either way.
+ */
+interface GatewayCapabilities {
+  /** True only when the gateway or an override explicitly confirms reasoning. */
+  reasoning: boolean;
+  /** Present only when the gateway/override gave at least one concrete fact. */
+  thinkingLevelMap?: Record<ThinkingLevel, string | null>;
+  /** True only when the gateway explicitly confirms at least one effort flag. */
+  supportsReasoningEffort: boolean;
 }
 
 interface ProviderConfig {
@@ -98,12 +130,16 @@ function displayName(id: string): string {
   return `${human} (${label})`;
 }
 
-/** Guess capabilities from model id */
+/**
+ * Guess capabilities from model id. This is a HINT ONLY: it can make a model
+ * eligible for gatewayCapabilities() to consider reasoning on, but it never
+ * fabricates effort/thinking-level support by itself (R1/R3: no false
+ * capability promises to the backend).
+ */
 function modelMeta(id: string): {
   reasoning: boolean;
   contextWindow: number;
   maxTokens: number;
-  thinkingLevelMap?: Record<string, string | null>;
 } {
   const lower = id.toLowerCase();
 
@@ -138,13 +174,91 @@ function modelMeta(id: string): {
     ? 8192
     : 16384;
 
-  const thinkingLevelMap: Record<string, string | null> | undefined = reasoning
-    ? isOpus
-      ? { low: "low", medium: "medium", high: "high", xhigh: "max" }
-      : { low: "low", medium: "medium", high: "high", xhigh: null }
-    : undefined;
+  return { reasoning, contextWindow, maxTokens };
+}
 
-  return { reasoning, contextWindow, maxTokens, thinkingLevelMap };
+// ---------------------------------------------------------------------------
+// Capability interpretation (gateway-confirmed facts only)
+// ---------------------------------------------------------------------------
+
+/** Gateway flag name for each standard pi thinking level. */
+const EFFORT_FLAG_BY_LEVEL: Record<Exclude<ThinkingLevel, "xhigh">, keyof LiteLLMModelInfo> = {
+  off: "supports_none_reasoning_effort",
+  minimal: "supports_minimal_reasoning_effort",
+  low: "supports_low_reasoning_effort",
+  medium: "supports_medium_reasoning_effort",
+  high: "supports_high_reasoning_effort",
+};
+
+/**
+ * Interpret gateway capability metadata conservatively.
+ *
+ * - `reasoning` is true only when the gateway or a manual override explicitly
+ *   confirms it (`supports_reasoning === true`, or `override.reasoning`). The
+ *   id-based heuristic is used only when the gateway is silent (undefined),
+ *   never to override an explicit gateway `false`.
+ * - `thinkingLevelMap` is derived ONLY from explicit gateway flags: standard
+ *   levels (off..high) keep the provider default (no null entry) unless the
+ *   gateway explicitly denies them. `xhigh` is mapped to "xhigh"/"max" only
+ *   when the gateway confirms `supports_xhigh_reasoning_effort` or
+ *   `supports_max_reasoning_effort`; an explicit false on both marks it
+ *   unsupported (null). If the gateway never confirms `supports_reasoning`
+ *   and no effort flag is set (reasoning only came from the heuristic or an
+ *   override), no map is produced — pi falls back to its own default mapping
+ *   instead of us promising an untested xhigh/max level.
+ * - `supportsReasoningEffort` is true only when at least one effort flag is
+ *   explicitly true. It is never inferred from a model name.
+ */
+function gatewayCapabilities(
+  heuristicReasoning: boolean,
+  info: LiteLLMModelInfo | undefined,
+  override: ModelOverride
+): GatewayCapabilities {
+  const overrideReasoning = typeof override.reasoning === "boolean" ? override.reasoning : undefined;
+  const gatewayReasoning = info?.supports_reasoning === true ? true : info?.supports_reasoning === false ? false : undefined;
+  // Priority: explicit override > explicit gateway fact > heuristic hint.
+  const reasoning = overrideReasoning ?? gatewayReasoning ?? heuristicReasoning;
+
+  if (!reasoning) return { reasoning: false, supportsReasoningEffort: false };
+
+  let anyEffortFlag = false;
+  const map: Record<ThinkingLevel, string | null> = {
+    off: "off",
+    minimal: "minimal",
+    low: "low",
+    medium: "medium",
+    high: "high",
+    xhigh: "xhigh",
+  };
+  for (const level of Object.keys(EFFORT_FLAG_BY_LEVEL) as Array<keyof typeof EFFORT_FLAG_BY_LEVEL>) {
+    const flag = info?.[EFFORT_FLAG_BY_LEVEL[level]];
+    if (flag === false) map[level] = null;
+    if (flag === true) anyEffortFlag = true;
+  }
+  const xhighFlag = info?.supports_xhigh_reasoning_effort;
+  const maxFlag = info?.supports_max_reasoning_effort;
+  if (xhighFlag === true || maxFlag === true) {
+    map.xhigh = maxFlag === true ? "max" : "xhigh";
+    anyEffortFlag = true;
+  } else if (xhighFlag === false && maxFlag === false) {
+    map.xhigh = null;
+  } else {
+    // Neither confirmed nor denied by the gateway: do not claim xhigh support
+    // when reasoning itself is unconfirmed by the gateway (heuristic-only).
+    if (gatewayReasoning !== true && overrideReasoning === undefined) map.xhigh = null;
+  }
+
+  // Only produce a map when we have at least one gateway-confirmed fact
+  // (explicit supports_reasoning, an effort flag, or an explicit override).
+  // A heuristic-only "reasoning: true" with a silent gateway has no factual
+  // basis for a map — pi's built-in default mapping is safer than a guess.
+  const hasFactualBasis = gatewayReasoning === true || anyEffortFlag || overrideReasoning !== undefined;
+
+  return {
+    reasoning: true,
+    thinkingLevelMap: hasFactualBasis ? map : undefined,
+    supportsReasoningEffort: anyEffortFlag,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -205,17 +319,16 @@ function resolveConfig(): ProviderConfig {
 // ---------------------------------------------------------------------------
 
 /**
- * Fetch GET /model/info for models whose /v1/models entry omits token limits.
- * Best-effort: this endpoint may be restricted, so failures degrade silently
- * back to the /v1/models values and then the heuristic.
+ * Fetch GET /model/info. Best-effort: this endpoint may be restricted or slow,
+ * so failures degrade silently — token limits fall back to /v1/models then the
+ * heuristic, and capability flags simply stay unconfirmed (never fabricated).
  */
-async function fetchModelInfo(
-  config: ProviderConfig
-): Promise<Map<string, { contextWindow?: number; maxTokens?: number }>> {
-  const out = new Map<string, { contextWindow?: number; maxTokens?: number }>();
+async function fetchModelInfo(config: ProviderConfig): Promise<Map<string, LiteLLMModelInfo>> {
+  const out = new Map<string, LiteLLMModelInfo>();
   try {
     const res = await fetch(`${config.baseUrl}/model/info`, {
       headers: { Authorization: `Bearer ${config.apiKey}` },
+      signal: AbortSignal.timeout(8_000),
     });
     if (!res.ok) return out;
 
@@ -223,10 +336,7 @@ async function fetchModelInfo(
     for (const entry of payload.data ?? []) {
       const info = entry.model_info;
       if (!entry.model_name || !info) continue;
-      out.set(entry.model_name, {
-        contextWindow: info.max_input_tokens ?? undefined,
-        maxTokens: info.max_output_tokens ?? undefined,
-      });
+      out.set(entry.model_name, info);
     }
   } catch {
     // Ignore — /v1/models plus the heuristic still produce a usable registration.
@@ -271,14 +381,15 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
     return;
   }
 
-  // Only query /model/info when /v1/models left gaps.
-  const needsModelInfo = models.some((m) => !m.max_input_tokens || !m.max_output_tokens);
-  const modelInfo = needsModelInfo
-    ? await fetchModelInfo(config)
-    : new Map<string, { contextWindow?: number; maxTokens?: number }>();
+  // Query /model/info whenever /v1/models left token-limit gaps, OR always,
+  // since it is also the only source of confirmed reasoning/effort capability
+  // facts. Skipping it would silently fall back to name-only heuristics for
+  // capabilities even when /v1/models already had context/output limits.
+  const modelInfo = await fetchModelInfo(config);
 
   let fromProvider = 0;
   let fromHeuristic = 0;
+  let reasoningFromGateway = 0;
   const unresolved: string[] = [];
 
   const registered = models.map((m) => {
@@ -288,27 +399,37 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
 
     // Priority: explicit override > /v1/models > /model/info > heuristic.
     const contextWindow =
-      override.contextWindow ?? m.max_input_tokens ?? info?.contextWindow ?? meta.contextWindow;
+      override.contextWindow ?? m.max_input_tokens ?? info?.max_input_tokens ?? meta.contextWindow;
     const maxTokens =
-      override.maxTokens ?? m.max_output_tokens ?? info?.maxTokens ?? meta.maxTokens;
+      override.maxTokens ?? m.max_output_tokens ?? info?.max_output_tokens ?? meta.maxTokens;
 
     const contextFromProvider =
-      override.contextWindow != null || m.max_input_tokens != null || info?.contextWindow != null;
+      override.contextWindow != null || m.max_input_tokens != null || info?.max_input_tokens != null;
     if (contextFromProvider) fromProvider++;
     else {
       fromHeuristic++;
       unresolved.push(m.id);
     }
 
+    // Capabilities: gateway-confirmed facts > explicit override > name heuristic.
+    const caps = gatewayCapabilities(meta.reasoning, info, override);
+    if (info?.supports_reasoning === true) reasoningFromGateway++;
+
     return {
       id: m.id,
       name: displayName(m.id),
-      reasoning: override.reasoning ?? meta.reasoning,
-      thinkingLevelMap: meta.thinkingLevelMap,
+      reasoning: caps.reasoning,
+      thinkingLevelMap: override.thinkingLevelMap ?? caps.thinkingLevelMap,
       input: ["text", "image"] as ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
       maxTokens,
+      compat: {
+        // This gateway is a standard OpenAI-compatible LiteLLM proxy. We only
+        // set the flag it genuinely governs (reasoning_effort transport); we
+        // never invent a backend-specific thinkingFormat we have not verified.
+        supportsReasoningEffort: caps.supportsReasoningEffort,
+      },
     };
   });
 
@@ -321,7 +442,8 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
 
   console.log(
     `[ollama-mke-sync] Registered ${models.length} model(s); ` +
-      `${fromProvider} context window(s) from gateway metadata, ${fromHeuristic} from heuristic fallback.`
+      `${fromProvider} context window(s) from gateway metadata, ${fromHeuristic} from heuristic fallback; ` +
+      `${reasoningFromGateway} model(s) with gateway-confirmed reasoning.`
   );
   if (unresolved.length > 0) {
     console.warn(

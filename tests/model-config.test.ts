@@ -87,10 +87,72 @@ describe("pure logic", () => {
     expect(ext.classifyRole("sdd-proposal")).toBe("deep");
     expect(ext.classifyRole("sdd-archive")).toBe("light");
     expect(ext.classifyRole("gentle-ai-worker")).toBe("standard");
-    const weak = { id: "y", reasoning: false, supportsXhigh: false, supportsLow: false, supportsMinimal: true, supportsNone: true };
-    expect(ext.clampEffort("xhigh", weak)).toBe("high");
-    expect(ext.clampEffort("low", weak)).toBe("minimal");
+
+    // No confirmed reasoning -> ANY non-off effort clamps all the way to
+    // "off", never to a fabricated "high"/"minimal" a non-reasoning model
+    // would ignore.
+    const nonReasoning = { id: "y", reasoning: false, supportsXhigh: false, supportsLow: false, supportsMinimal: true, supportsNone: true };
+    expect(ext.clampEffort("xhigh", nonReasoning)).toBe("off");
+    expect(ext.clampEffort("low", nonReasoning)).toBe("off");
+
+    // Reasoning-capable, xhigh explicitly denied -> steps down to the
+    // nearest level the gateway does NOT explicitly deny (high, unknown).
+    const xhighDenied = { id: "z", reasoning: true, supportsXhigh: false };
+    expect(ext.clampEffort("xhigh", xhighDenied)).toBe("high");
+
+    // Reasoning-capable, low explicitly denied but minimal unknown -> steps
+    // down to minimal (first non-false candidate below "low").
+    const lowDenied = { id: "w", reasoning: true, supportsLow: false };
+    expect(ext.clampEffort("low", lowDenied)).toBe("minimal");
+
+    // Every level down to off explicitly denied -> "off" is the floor.
+    const allDenied = {
+      id: "v", reasoning: true,
+      supportsXhigh: false, supportsHigh: false, supportsMedium: false,
+      supportsLow: false, supportsMinimal: false, supportsNone: false,
+    };
+    expect(ext.clampEffort("high", allDenied)).toBe("off");
+
+    // Unknown (undefined) support for the requested level is neutral, not a
+    // denial -- the request passes through unchanged.
+    const allUnknown = { id: "u", reasoning: true };
+    expect(ext.clampEffort("medium", allUnknown)).toBe("medium");
+    expect(ext.clampEffort("xhigh", allUnknown)).toBe("xhigh");
+
     expect(ext.clampEffort("high", undefined)).toBe("high");
+  });
+
+  test("providerQualifiedModelId: slash-containing gateway ids are not mistaken for already-qualified ids", () => {
+    const { providerKey } = ext.resolveGatewayConfig();
+
+    // A raw gateway id containing '/' that is NOT already provider-qualified
+    // must still get the provider prefix -- this was the bug: the previous
+    // implementation returned such ids unchanged, silently misrouting them.
+    expect(ext.providerQualifiedModelId("bedrock/claude-sonnet-4.6")).toBe(`${providerKey}/bedrock/claude-sonnet-4.6`);
+
+    // An id already prefixed with the configured provider key is left as-is
+    // (no double-prefixing).
+    expect(ext.providerQualifiedModelId(`${providerKey}/plain-model`)).toBe(`${providerKey}/plain-model`);
+
+    // A plain id with no slash gets prefixed normally.
+    expect(ext.providerQualifiedModelId("plain-model")).toBe(`${providerKey}/plain-model`);
+  });
+
+  test("stripProviderPrefix: only removes the leading provider segment, not slashes inside the gateway id", () => {
+    const { providerKey } = ext.resolveGatewayConfig();
+    expect(ext.stripProviderPrefix(`${providerKey}/bedrock/claude-sonnet-4.6`)).toBe("bedrock/claude-sonnet-4.6");
+    expect(ext.stripProviderPrefix("bedrock/claude-sonnet-4.6")).toBe("bedrock/claude-sonnet-4.6");
+    expect(ext.stripProviderPrefix(undefined)).toBeUndefined();
+  });
+
+  test("supportFlag: tri-state passthrough per level", () => {
+    const model = { id: "m", reasoning: true, supportsNone: true, supportsMinimal: false, supportsLow: undefined, supportsMedium: true, supportsHigh: false, supportsXhigh: undefined };
+    expect(ext.supportFlag(model, "off")).toBe(true);
+    expect(ext.supportFlag(model, "minimal")).toBe(false);
+    expect(ext.supportFlag(model, "low")).toBeUndefined();
+    expect(ext.supportFlag(model, "medium")).toBe(true);
+    expect(ext.supportFlag(model, "high")).toBe(false);
+    expect(ext.supportFlag(model, "xhigh")).toBeUndefined();
   });
 
   test("percentile picking and full preset plans", () => {
@@ -108,6 +170,16 @@ describe("pure logic", () => {
       expect(plan.length).toBe(2);
       expect(catalog.find((m) => m.id === plan[0].model)?.reasoning).toBe(true);
     }
+  });
+
+  test("buildPresetPlan: no reasoning-capable priced model -> error string, never a silent non-reasoning fallback for deep roles", () => {
+    const noReasoningCatalog = Array.from({ length: 5 }, (_, i) => ({
+      id: `plain-${i}`, reasoning: false, inputCostPerToken: (i + 1) / 1e6,
+    }));
+    const roles = [{ name: "sdd-proposal" }] as any;
+    const result = ext.buildPresetPlan("balanced", noReasoningCatalog, roles);
+    expect(typeof result).toBe("string");
+    expect(result as string).toMatch(/reasoning-capable model/i);
   });
 });
 

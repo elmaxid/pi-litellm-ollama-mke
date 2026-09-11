@@ -78,7 +78,9 @@ What it can do:
 - **View / edit roles** — lists every discovered role (agent `.md` definitions plus existing `model_profiles` entries) with its *effective* model and effort, and where the value comes from: `model_profiles` beat agent frontmatter, which beats the defaults.
 - **Change a role's model or effort** — pick from the live gateway catalog (marked with `[R]` for reasoning support and per-million input cost); efforts span `off, minimal, low, medium, high, xhigh`. A role's profile can also be cleared so it inherits again.
 - **Defaults** — edit `default_model` and `default_effort`.
-- **Apply preset** — `cheap`, `balanced`, or `quality` reassigns every role at once. The preset picks real models from the gateway's `/model/info` pricing (15th/50th/90th cost percentile), requires a reasoning-capable model for deep roles (proposal, design, verify, review…), lightens roles like sync/archive/status, and clamps the requested effort to what the chosen model actually supports (`supports_*_reasoning_effort`).
+- **Apply preset** — `cheap`, `balanced`, or `quality` reassigns every role at once. The preset picks real models from the gateway's `/model/info` pricing (15th/50th/90th cost percentile), lightens roles like sync/archive/status, and clamps the requested effort to what the chosen model actually supports (`supports_*_reasoning_effort`). Deep roles (proposal, design, verify, review…) **require** a gateway-confirmed reasoning-capable model at that price tier; if none exists, the preset refuses to run rather than silently assigning reasoning effort to a non-reasoning model.
+
+Capability facts come only from the gateway (`/model/info` `supports_reasoning` / `supports_*_reasoning_effort`) or an explicit `modelOverrides` entry — never from guessing off a model's name. A flag the gateway does not publish is treated as *unknown*, not as *supported*: `/roles` will not promise an effort level the backend never confirmed, and manually setting a role's effort is rejected (with an explanation) when the selected model's catalog entry explicitly denies that level or lacks confirmed reasoning.
 
 Every write shows a summary first, creates a timestamped `subagents.json.bak-*` backup, and preserves any unknown keys already in the file. Changes apply to agents launched afterwards.
 
@@ -106,13 +108,16 @@ The model-sync extension accepts per-model overrides at `providers["ollama-mke"]
         "bedrock/claude-sonnet-4.6": {
           "contextWindow": 200000,
           "maxTokens": 16384,
-          "reasoning": true
+          "reasoning": true,
+          "thinkingLevelMap": { "medium": "medium", "high": "high", "xhigh": null }
         }
       }
     }
   }
 }
 ```
+
+A gateway model id like `bedrock/claude-sonnet-4.6` already contains a `/` from LiteLLM's own routing — that is NOT the same as being prefixed with Pi's `ollama-mke` provider key. `/roles` and the sync extension both qualify it correctly as `ollama-mke/bedrock/claude-sonnet-4.6` when writing profiles, so `modelOverrides` keys should use the raw gateway id (as shown above), not the Pi-qualified one.
 
 ## Seeing only ollama-mke in `/model` or `--list-models`
 

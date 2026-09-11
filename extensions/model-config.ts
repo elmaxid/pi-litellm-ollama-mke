@@ -64,11 +64,19 @@ interface AgentDefinitionInfo {
   thinking?: ThinkingLevel;
 }
 
+/**
+ * Per-effort support is tri-state, mirroring what /model/info actually says:
+ *   true  = gateway explicitly confirms the level works
+ *   false = gateway explicitly denies the level
+ *   undefined = gateway did not publish a decision (unknown, NOT assumed true)
+ */
 interface CatalogEntry {
   id: string;
   reasoning: boolean;
   inputCostPerToken?: number;
   supportsXhigh?: boolean;
+  supportsHigh?: boolean;
+  supportsMedium?: boolean;
   supportsLow?: boolean;
   supportsMinimal?: boolean;
   supportsNone?: boolean;
@@ -153,14 +161,19 @@ async function fetchCatalog(): Promise<CatalogEntry[]> {
     if (!entry.model_name) continue;
     const info = entry.model_info ?? {};
     const cost = info.input_cost_per_token;
+    // Tri-state: undefined stays undefined (unknown), never coerced to true.
+    // Only an explicit `true`/`false` from the gateway counts as a fact.
+    const flag = (v: unknown): boolean | undefined => (typeof v === "boolean" ? v : undefined);
     out.push({
       id: entry.model_name,
-      reasoning: Boolean(info.supports_reasoning),
+      reasoning: info.supports_reasoning === true,
       inputCostPerToken: typeof cost === "number" && cost > 0 ? cost : undefined,
-      supportsXhigh: Boolean(info.supports_xhigh_reasoning_effort) || Boolean(info.supports_max_reasoning_effort),
-      supportsLow: info.supports_low_reasoning_effort !== false,
-      supportsMinimal: info.supports_minimal_reasoning_effort !== false,
-      supportsNone: info.supports_none_reasoning_effort !== false,
+      supportsXhigh: flag(info.supports_xhigh_reasoning_effort) ?? flag(info.supports_max_reasoning_effort),
+      supportsHigh: flag(info.supports_high_reasoning_effort),
+      supportsMedium: flag(info.supports_medium_reasoning_effort),
+      supportsLow: flag(info.supports_low_reasoning_effort),
+      supportsMinimal: flag(info.supports_minimal_reasoning_effort),
+      supportsNone: flag(info.supports_none_reasoning_effort),
     });
   }
   return out.sort((a, b) => a.id.localeCompare(b.id));
@@ -325,23 +338,72 @@ function pickModelByCost(catalog: CatalogEntry[], percentile: number, requireRea
   return sorted[index];
 }
 
+/**
+ * Per-level support lookup used by clampEffort. `undefined` means "gateway
+ * did not say" -- treated as neutral (not proof of support), matching
+ * gatewayCapabilities() in litellm-sync.ts.
+ */
+const EFFORT_ORDER: ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function supportFlag(model: CatalogEntry, level: ThinkingLevel): boolean | undefined {
+  switch (level) {
+    case "off":
+      return model.supportsNone;
+    case "minimal":
+      return model.supportsMinimal;
+    case "low":
+      return model.supportsLow;
+    case "medium":
+      return model.supportsMedium;
+    case "high":
+      return model.supportsHigh;
+    case "xhigh":
+      return model.supportsXhigh;
+  }
+}
+
+/**
+ * Clamp a requested effort to a level the model can actually run.
+ *
+ * - Never assigns a non-"off" effort to a model without confirmed reasoning:
+ *   returns "off" regardless of what was requested (deep roles must not get
+ *   silently degraded to a reasoning effort a non-reasoning model ignores or
+ *   rejects).
+ * - When the gateway explicitly denies a level (`false`), steps down through
+ *   EFFORT_ORDER to the nearest level that is NOT explicitly denied. If every
+ *   level down to "off" is denied, returns "off".
+ * - When support is unknown (`undefined`) for the requested level, keeps it:
+ *   unknown is not proof of failure, and pi's own thinkingLevelMap (once
+ *   litellm-sync registers confirmed capabilities) will reject it if it truly
+ *   is unsupported. Silence never promotes to "supported" but also never
+ *   forces a downgrade on its own.
+ */
 function clampEffort(effort: ThinkingLevel, model: CatalogEntry | undefined): ThinkingLevel {
   if (!model) return effort;
-  if (effort === "xhigh" && !model.supportsXhigh) return "high";
-  if (effort === "low" && !model.supportsLow && model.supportsMinimal) return "minimal";
-  if (effort === "off" && !model.supportsNone) return "minimal";
-  return effort;
+  if (!model.reasoning) return "off";
+
+  if (supportFlag(model, effort) !== false) return effort;
+
+  const startIndex = EFFORT_ORDER.indexOf(effort);
+  for (let i = startIndex - 1; i >= 0; i--) {
+    const candidate = EFFORT_ORDER[i];
+    if (supportFlag(model, candidate) !== false) return candidate;
+  }
+  return "off";
 }
 
 function buildPresetPlan(preset: string, catalog: CatalogEntry[], roles: ResolvedRole[]): PresetPlanEntry[] | string {
   const percentile = preset === "cheap" ? 0.15 : preset === "balanced" ? 0.5 : 0.9;
-  // Deep roles need a reasoning-capable model; standard roles prefer one but
-  // fall back to the whole pool; light roles never require it.
-  const deepModel = pickModelByCost(catalog, percentile, true) ?? pickModelByCost(catalog, percentile, false);
+  // Deep roles REQUIRE a reasoning-capable model -- no non-reasoning fallback.
+  // Standard/light roles prefer one but do not require it.
+  const deepModel = pickModelByCost(catalog, percentile, true);
   const standardModel = pickModelByCost(catalog, percentile, false);
   const lightModel = pickModelByCost(catalog, Math.min(percentile, 0.15), false);
-  if (!deepModel || !standardModel || !lightModel) {
+  if (!standardModel || !lightModel) {
     return "The gateway did not expose usable pricing data (/model/info) — presets need real costs to pick models. Check that the gateway is reachable and exposes input_cost_per_token.";
+  }
+  if (!deepModel) {
+    return "No reasoning-capable model with pricing data was found at this tier — deep roles (proposal/design/verify/review/judge) cannot be assigned without silently dropping reasoning. Add a modelOverride confirming reasoning for at least one model, or adjust the preset tier.";
   }
   const plans: PresetPlanEntry[] = [];
   for (const role of roles) {
@@ -360,9 +422,38 @@ function buildPresetPlan(preset: string, catalog: CatalogEntry[], roles: Resolve
   return plans;
 }
 
+/**
+ * Qualify a gateway model id with the configured Pi provider prefix.
+ *
+ * A gateway model id CAN legitimately contain '/' -- e.g. LiteLLM entries
+ * like "bedrock/claude-sonnet-4.6" -- without that meaning it is already
+ * prefixed with our Pi provider key. Blindly returning any id containing '/'
+ * unchanged (the previous behavior) silently misrouted those models: pi
+ * would resolve them against a provider named "bedrock", not "ollama-mke".
+ *
+ * Every id coming out of the gateway catalog (fetchCatalog()/CatalogEntry.id)
+ * is always the RAW gateway id, never already Pi-provider-qualified -- so the
+ * only case that must not be double-prefixed is when the id already starts
+ * with exactly "<providerKey>/".
+ */
 function providerQualifiedModelId(id: string): string {
-  if (id.includes("/")) return id;
-  return `${resolveGatewayConfig().providerKey}/${id}`;
+  const { providerKey } = resolveGatewayConfig();
+  if (id === providerKey || id.startsWith(`${providerKey}/`)) return id;
+  return `${providerKey}/${id}`;
+}
+
+/**
+ * Strip the Pi provider prefix from a stored model id so it can be matched
+ * back against catalog entries (which are always raw gateway ids). Unlike
+ * the previous `role.model?.split("/").pop()` call sites, this only removes
+ * the LEADING "<providerKey>/" segment and leaves any slash that is part of
+ * the gateway id itself (e.g. "bedrock/claude-sonnet-4.6") intact.
+ */
+function stripProviderPrefix(id: string | undefined): string | undefined {
+  if (!id) return id;
+  const { providerKey } = resolveGatewayConfig();
+  const prefix = `${providerKey}/`;
+  return id.startsWith(prefix) ? id.slice(prefix.length) : id;
 }
 
 // ---------------------------------------------------------------------------
@@ -470,7 +561,7 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
           if (edit === undefined || edit === "Back") continue;
 
           if (edit === "Change model") {
-            const modelId = await chooseModel(ui, catalog, role.model?.split("/").pop());
+            const modelId = await chooseModel(ui, catalog, stripProviderPrefix(role.model));
             if (modelId === undefined) continue;
             const summary =
               modelId === ""
@@ -490,6 +581,31 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
           } else if (edit === "Change effort") {
             const effort = await chooseEffort(ui, role.effort);
             if (effort === undefined) continue;
+            // Validate against the currently-selected model's confirmed
+            // capabilities when the catalog has data for it. This never
+            // silently clamps: an incompatible manual choice is rejected
+            // with an explanation instead of being rewritten to something
+            // else the user did not ask for.
+            if (effort !== "") {
+              const targetModelId = stripProviderPrefix(role.model);
+              const catalogEntry = catalog.find((m) => m.id === targetModelId);
+              if (catalogEntry) {
+                if (effort !== "off" && !catalogEntry.reasoning) {
+                  await ui.notify(
+                    `${role.name}: ${effort} requires a reasoning-capable model, but ${catalogEntry.id} is not confirmed reasoning-capable. Choose a reasoning model first, or set effort to off.`,
+                    "error"
+                  );
+                  continue;
+                }
+                if (supportFlag(catalogEntry, effort) === false) {
+                  await ui.notify(
+                    `${role.name}: ${catalogEntry.id} explicitly does not support ${effort} reasoning effort (per /model/info). Choose a different effort.`,
+                    "error"
+                  );
+                  continue;
+                }
+              }
+            }
             const summary =
               effort === ""
                 ? `${role.name}: effort cleared (inherits ${config.default_effort ?? "none"})`
@@ -525,7 +641,7 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
           if (which === undefined || which === "Back") continue;
 
           if (which === "Change default_model") {
-            const modelId = await chooseModel(ui, catalog, config.default_model?.split("/").pop());
+            const modelId = await chooseModel(ui, catalog, stripProviderPrefix(config.default_model));
             if (modelId === undefined) continue;
             const summary =
               modelId === ""
@@ -568,12 +684,12 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
             (p) =>
               `${p.role} [${p.roleClass}] → ${p.model} · ${p.effort}${p.clampedFrom ? ` (clamped from ${p.clampedFrom})` : ""}`
           );
-          // Surface the two silent-quality cases of percentile picking.
+          // Surface the silent-quality case of percentile picking. Deep
+          // roles are now guaranteed a reasoning-capable model by
+          // buildPresetPlan() (it returns an error string instead of a plan
+          // when none exists), so only the "collapsed to one model" case
+          // remains worth flagging here.
           const notes: string[] = [];
-          const deepPlan = plan.find((p) => p.roleClass === "deep");
-          if (deepPlan && catalog.find((m) => m.id === deepPlan.model)?.reasoning === false) {
-            notes.push("note: no reasoning-capable model at this price tier — deep roles will run without reasoning.");
-          }
           if (plan.length > 1 && new Set(plan.map((p) => p.model)).size === 1) {
             notes.push("note: every class resolved to the same model (small catalog or uniform pricing).");
           }
@@ -612,6 +728,9 @@ export {
   loadSubagentsConfig,
   parseFrontmatterScalars,
   pickModelByCost,
+  providerQualifiedModelId,
   resolveGatewayConfig,
   resolveRoles,
+  stripProviderPrefix,
+  supportFlag,
 };
