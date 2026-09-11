@@ -119,6 +119,12 @@ The model-sync extension accepts per-model overrides at `providers["ollama-mke"]
 
 A gateway model id like `bedrock/claude-sonnet-4.6` already contains a `/` from LiteLLM's own routing — that is NOT the same as being prefixed with Pi's `ollama-mke` provider key. `/roles` and the sync extension both qualify it correctly as `ollama-mke/bedrock/claude-sonnet-4.6` when writing profiles, so `modelOverrides` keys should use the raw gateway id (as shown above), not the Pi-qualified one.
 
+### Role profile ownership (infrastructure, not yet wired into `/roles`)
+
+`extensions/role-ownership.ts` adds a sidecar at `~/.pi/agent/gentle-ai/role-profiles.json` that records which `model_profiles` entries a future automated preset/apply last wrote (`managed`), versus profiles that already existed or were hand-edited since (`custom` / `stale-managed`). It never becomes the source of truth — `subagents.json` stays authoritative — and it never overwrites a profile it did not itself record writing.
+
+This module is not called by `/roles` yet: it is phase-2 infrastructure, added and tested in isolation so a later automated-apply feature can layer on top without guessing whether an existing profile is safe to touch. Global scope only for now; project-scoped `<cwd>/.pi/subagents.json` profiles are explicitly out of scope until a later phase.
+
 ## Seeing only ollama-mke in `/model` or `--list-models`
 
 Pi ships several **built-in** providers (OpenAI, Anthropic, OpenRouter, Google, etc. — not packages, they come with the Pi binary) that activate automatically whenever Pi detects the matching credential environment variable, regardless of this package. If you only want to see `ollama-mke`, make sure none of these are set in your shell (check with `env | grep -E "_API_KEY|_TOKEN"`):
