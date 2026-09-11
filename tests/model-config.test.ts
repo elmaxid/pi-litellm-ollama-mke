@@ -7,7 +7,7 @@
  * The real ~/.pi/agent/subagents.json is never written; its hash is asserted
  * unchanged around the run.
  */
-import { describe, test, expect, mock, beforeAll } from "bun:test";
+import { describe, test, expect, mock, beforeAll, afterAll } from "bun:test";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -28,6 +28,7 @@ const realHashBefore = realExistedBefore
 const FAKE_HOME = join("/tmp", `mke-test-${process.pid}`);
 mock.module("node:os", () => ({ homedir: () => FAKE_HOME, default: { homedir: () => FAKE_HOME } }));
 const ext: any = await import("../extensions/model-config.ts");
+const mod: any = await import("../extensions/role-ownership.ts");
 
 /** Fixture cwd with project-level agent definitions (.pi/agents/*.md). */
 function fixtureAgentsDir(agents: Array<[string, string]>): string {
@@ -249,5 +250,160 @@ describe("e2e /roles", () => {
     // still absent if it did not (the suite never creates the user's config).
     if (realHashBefore === null) expect(existsSync(realSubagentsPath)).toBe(false);
     else expect(createHash("sha256").update(readFileSync(realSubagentsPath)).digest("hex")).toBe(realHashBefore);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// E2E: ownership sidecar integration (phase 2)
+// ---------------------------------------------------------------------------
+describe("e2e /roles ownership integration", () => {
+  const realOwnershipPath = join(REAL_HOME, ".pi/agent/gentle-ai/role-profiles.json");
+  const realOwnershipExisted = existsSync(realOwnershipPath);
+  const realOwnershipHashBefore = realOwnershipExisted
+    ? createHash("sha256").update(readFileSync(realOwnershipPath)).digest("hex")
+    : null;
+
+  // Minimal reasoning-capable catalog served in place of a real gateway, so
+  // "Apply preset" can be exercised end-to-end without network access.
+  const modelInfoPayload = {
+    data: [
+      {
+        model_name: "deep-model",
+        model_info: { supports_reasoning: true, input_cost_per_token: 0.000002, supports_xhigh_reasoning_effort: true },
+      },
+      {
+        model_name: "cheap-model",
+        model_info: { supports_reasoning: false, input_cost_per_token: 0.0000001 },
+      },
+    ],
+  };
+  let originalFetch: typeof fetch;
+
+  beforeAll(() => {
+    originalFetch = globalThis.fetch;
+    // @ts-expect-error test-only stub, narrower than the real fetch signature
+    globalThis.fetch = async (url: string) => {
+      if (String(url).includes("/model/info")) {
+        return new Response(JSON.stringify(modelInfoPayload), { status: 200 });
+      }
+      return new Response("not found", { status: 404 });
+    };
+  });
+
+  afterAll(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  function resetFixture(config: any) {
+    rmSync(join(FAKE_HOME, ".pi"), { recursive: true, force: true });
+    mkdirSync(join(FAKE_HOME, ".pi/agent"), { recursive: true });
+    writeFileSync(join(FAKE_HOME, ".pi/agent/subagents.json"), `${JSON.stringify(config, null, 2)}\n`);
+    writeFileSync(
+      join(FAKE_HOME, ".pi/agent/models.json"),
+      JSON.stringify({ providers: { "ollama-mke": { baseUrl: "http://gateway.invalid", apiKey: "k" } } })
+    );
+  }
+
+  async function runHandler(script: Array<{ match: RegExp; answer: string | RegExp }>) {
+    let handler: undefined | ((args: string, ctx: any) => Promise<void>);
+    ext.default({ registerCommand: (_n: string, def: any) => { handler = def.handler; } } as any);
+    let step = 0;
+    const notices: Array<{ m: string; l: string }> = [];
+    const ui = {
+      async select(title: string, options: string[]) {
+        const rule = script[step++];
+        expect(rule).toBeDefined();
+        expect(rule.match.test(title)).toBe(true);
+        const a = rule.answer;
+        if (a instanceof RegExp) {
+          const found = options.find((o) => a.test(o));
+          expect(found).toBeDefined();
+          return found as string;
+        }
+        return a;
+      },
+      async confirm() { return true; },
+      notify(m: string, l: string) { notices.push({ m, l }); },
+    };
+    await handler!("", { ui });
+    expect(step).toBe(script.length);
+    return notices;
+  }
+
+  test("a manual model/effort edit disowns the role, so a later preset never overwrites it silently", async () => {
+    resetFixture({
+      default_effort: "low",
+      model_profiles: { "sdd-apply": { model: "ollama-mke/deep-model", effort: "medium" } },
+    });
+    // Pre-seed ownership as if a prior preset had written this exact profile.
+    const ownership = mod.recordManagedProfile(
+      mod.loadRoleOwnership(),
+      "sdd-apply",
+      { model: "ollama-mke/deep-model", effort: "medium" }
+    );
+    mod.saveRoleOwnership(ownership);
+    expect(
+      mod.computeOwnershipStatus(mod.loadRoleOwnership(), "sdd-apply", { model: "ollama-mke/deep-model", effort: "medium" })
+    ).toBe("managed");
+
+    await runHandler([
+      { match: /Model Config/, answer: "View / edit roles" },
+      { match: /Roles \(model/, answer: /^sdd-apply/ },
+      { match: /Edit sdd-apply/, answer: "Change effort" },
+      { match: /Effort \(current: medium\)/, answer: "high" },
+      { match: /Model Config/, answer: "Exit" },
+    ]);
+
+    const written = JSON.parse(readFileSync(join(FAKE_HOME, ".pi/agent/subagents.json"), "utf-8"));
+    expect(written.model_profiles["sdd-apply"].effort).toBe("high");
+
+    const finalOwnership = mod.loadRoleOwnership();
+    expect(
+      mod.computeOwnershipStatus(finalOwnership, "sdd-apply", written.model_profiles["sdd-apply"])
+    ).toBe("custom");
+  });
+
+  test("Apply preset skips a custom profile and reports it, but still applies to an inherited role", async () => {
+    resetFixture({
+      // sdd-apply has a hand-set profile the preset never wrote -> custom.
+      model_profiles: { "sdd-apply": { model: "ollama-mke/cheap-model", effort: "off" } },
+    });
+
+    const notices = await runHandler([
+      { match: /Model Config/, answer: "Apply preset (cheap / balanced / quality)" },
+      { match: /Preset:/, answer: "balanced" },
+      { match: /Model Config/, answer: "Exit" },
+    ]);
+
+    const written = JSON.parse(readFileSync(join(FAKE_HOME, ".pi/agent/subagents.json"), "utf-8"));
+    // The custom profile must survive the preset run untouched.
+    expect(written.model_profiles["sdd-apply"]).toEqual({ model: "ollama-mke/cheap-model", effort: "off" });
+
+    const skipNotice = notices.find((n) => /skipped/i.test(n.m));
+    expect(skipNotice).toBeDefined();
+    expect(skipNotice!.m).toMatch(/sdd-apply \(custom\)/);
+  });
+
+  test("Apply preset records ownership for roles it writes, and a second run treats them as still managed", async () => {
+    resetFixture({ model_profiles: { "sdd-apply": {} } });
+
+    await runHandler([
+      { match: /Model Config/, answer: "Apply preset (cheap / balanced / quality)" },
+      { match: /Preset:/, answer: "balanced" },
+      { match: /Model Config/, answer: "Exit" },
+    ]);
+
+    const written = JSON.parse(readFileSync(join(FAKE_HOME, ".pi/agent/subagents.json"), "utf-8"));
+    expect(written.model_profiles["sdd-apply"]).toBeDefined();
+
+    const ownership = mod.loadRoleOwnership();
+    expect(
+      mod.computeOwnershipStatus(ownership, "sdd-apply", written.model_profiles["sdd-apply"])
+    ).toBe("managed");
+  });
+
+  test("the real user ownership sidecar is never touched by this suite", () => {
+    if (realOwnershipHashBefore === null) expect(existsSync(realOwnershipPath)).toBe(false);
+    else expect(createHash("sha256").update(readFileSync(realOwnershipPath)).digest("hex")).toBe(realOwnershipHashBefore);
   });
 });

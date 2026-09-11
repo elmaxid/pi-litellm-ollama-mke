@@ -36,6 +36,14 @@ import {
 } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import {
+  computeOwnershipStatus,
+  forgetRole,
+  loadRoleOwnership,
+  recordManagedProfile,
+  saveRoleOwnership,
+  type OwnershipStatus,
+} from "./role-ownership.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -472,6 +480,17 @@ const SOURCE_TAG: Record<ProfileSource, string> = {
   unresolved: "! unresolved",
 };
 
+/** Ownership tag shown next to each role in "View / edit roles". Only
+ *  meaningful for roles with an explicit model_profiles entry -- "inherited"
+ *  roles (no explicit profile) never show a tag since there is nothing to
+ *  own yet. */
+const OWNERSHIP_TAG: Record<OwnershipStatus, string> = {
+  inherited: "",
+  managed: "[managed by preset]",
+  custom: "[custom]",
+  "stale-managed": "[stale-managed -- edited since last preset]",
+};
+
 /** Minimal shape of the pi TUI context used here (keeps this file independent
  *  from pi's internal UI types, which are not part of the public surface). */
 interface Ui {
@@ -545,9 +564,12 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
         if (action === undefined || action === "Exit") return;
 
         if (action === "View / edit roles") {
-          const options = roles.map(
-            (r) => `${r.name} → ${r.model ?? "?"} · ${r.effort ?? "?"} ${SOURCE_TAG[r.source]}`
-          );
+          const ownership = loadRoleOwnership();
+          const options = roles.map((r) => {
+            const status = computeOwnershipStatus(ownership, r.name, config.model_profiles?.[r.name]);
+            const tag = [SOURCE_TAG[r.source], OWNERSHIP_TAG[status]].filter(Boolean).join(" ");
+            return `${r.name} → ${r.model ?? "?"} · ${r.effort ?? "?"} ${tag}`;
+          });
           const picked = await ui.select("Roles (model · effort · source):", options);
           if (picked === undefined) continue;
           const role = roles[options.indexOf(picked)];
@@ -577,6 +599,11 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
               if (Object.keys(config.model_profiles).length === 0) delete config.model_profiles;
             }
             const backup = saveSubagentsConfig(config);
+            // A manual edit is always the human's decision, never the
+            // preset's: disown the role so a future "Apply preset" never
+            // treats a hand-picked model as something it wrote and is free
+            // to overwrite.
+            saveRoleOwnership(forgetRole(loadRoleOwnership(), role.name));
             await ui.notify(`Saved. ${summary}${backup ? `\nBackup: ${basename(backup)}` : ""}`, "info");
           } else if (edit === "Change effort") {
             const effort = await chooseEffort(ui, role.effort);
@@ -620,6 +647,8 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
               if (Object.keys(config.model_profiles).length === 0) delete config.model_profiles;
             }
             const backup = saveSubagentsConfig(config);
+            // Same rule as "Change model": a manual edit disowns the role.
+            saveRoleOwnership(forgetRole(loadRoleOwnership(), role.name));
             await ui.notify(`Saved. ${summary}${backup ? `\nBackup: ${basename(backup)}` : ""}`, "info");
           } else if (edit === "Clear profile (inherit again)") {
             if (!(await confirmWrite(ui, `${role.name}: profile removed — will inherit default/definition.`))) continue;
@@ -628,6 +657,8 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
               if (Object.keys(config.model_profiles).length === 0) delete config.model_profiles;
             }
             const backup = saveSubagentsConfig(config);
+            // Nothing left to own once the profile is cleared.
+            saveRoleOwnership(forgetRole(loadRoleOwnership(), role.name));
             await ui.notify(`Saved. ${role.name} inherits again.${backup ? `\nBackup: ${basename(backup)}` : ""}`, "info");
           }
           continue;
@@ -680,7 +711,22 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
             await ui.notify(plan, "error");
             continue;
           }
-          const lines = plan.map(
+          // Ownership gate: only touch roles that are "inherited" (no
+          // explicit profile yet) or "managed" (still matches what a prior
+          // preset wrote). "custom" and "stale-managed" roles are a human's
+          // decision and are always skipped, never silently overwritten --
+          // this replaces the old `config.model_profiles = {}` wipe, which
+          // used to destroy every hand-configured role on every preset run.
+          const ownershipBefore = loadRoleOwnership();
+          const applicable: PresetPlanEntry[] = [];
+          const skipped: Array<{ entry: PresetPlanEntry; status: OwnershipStatus }> = [];
+          for (const p of plan) {
+            const status = computeOwnershipStatus(ownershipBefore, p.role, config.model_profiles?.[p.role]);
+            if (status === "custom" || status === "stale-managed") skipped.push({ entry: p, status });
+            else applicable.push(p);
+          }
+
+          const lines = applicable.map(
             (p) =>
               `${p.role} [${p.roleClass}] → ${p.model} · ${p.effort}${p.clampedFrom ? ` (clamped from ${p.clampedFrom})` : ""}`
           );
@@ -690,25 +736,39 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
           // when none exists), so only the "collapsed to one model" case
           // remains worth flagging here.
           const notes: string[] = [];
-          if (plan.length > 1 && new Set(plan.map((p) => p.model)).size === 1) {
+          if (applicable.length > 1 && new Set(applicable.map((p) => p.model)).size === 1) {
             notes.push("note: every class resolved to the same model (small catalog or uniform pricing).");
+          }
+          if (skipped.length > 0) {
+            notes.push(
+              `skipped ${skipped.length} role(s) with a profile this preset did not write:\n` +
+                skipped.map((s) => `  - ${s.entry.role} (${s.status})`).join("\n")
+            );
+          }
+          if (applicable.length === 0) {
+            await ui.notify(
+              `Preset "${preset}": every role already has a custom or stale-managed profile -- nothing to apply.\n${notes.join("\n\n")}`,
+              "info"
+            );
+            continue;
           }
           const approved = await ui.confirm(
             `Apply preset "${preset}"?`,
-            `${notes.length ? notes.join("\n") + "\n\n" : ""}${lines.join("\n")}\n\nThis rewrites model_profiles for all ${plan.length} roles.`
+            `${notes.length ? notes.join("\n\n") + "\n\n" : ""}${lines.join("\n")}\n\nThis writes model_profiles for ${applicable.length} of ${plan.length} role(s).`
           );
           if (!approved) continue;
-          if (!(await confirmWrite(ui, `Preset "${preset}": ${plan.length} roles updated.`))) continue;
-          config.model_profiles = {};
-          for (const p of plan) {
-            config.model_profiles[p.role] = {
-              model: providerQualifiedModelId(p.model),
-              effort: p.effort,
-            };
+          if (!(await confirmWrite(ui, `Preset "${preset}": ${applicable.length} roles updated.`))) continue;
+          config.model_profiles ??= {};
+          let ownershipAfter = ownershipBefore;
+          for (const p of applicable) {
+            const profile = { model: providerQualifiedModelId(p.model), effort: p.effort };
+            config.model_profiles[p.role] = profile;
+            ownershipAfter = recordManagedProfile(ownershipAfter, p.role, profile);
           }
           const backup = saveSubagentsConfig(config);
+          saveRoleOwnership(ownershipAfter);
           await ui.notify(
-            `Preset "${preset}" applied to ${plan.length} roles.${backup ? `\nBackup: ${basename(backup)}` : ""}\nNote: agents launched after this point pick up the new profiles.`,
+            `Preset "${preset}" applied to ${applicable.length} role(s)${skipped.length ? ` (${skipped.length} skipped)` : ""}.${backup ? `\nBackup: ${basename(backup)}` : ""}\nNote: agents launched after this point pick up the new profiles.`,
             "info"
           );
         }
