@@ -175,7 +175,11 @@ async function fetchCatalog(): Promise<CatalogEntry[]> {
     out.push({
       id: entry.model_name,
       reasoning: info.supports_reasoning === true,
-      inputCostPerToken: typeof cost === "number" && cost > 0 ? cost : undefined,
+      // A gateway-confirmed 0 (e.g. a free/local model) is a real price,
+      // not "unknown" -- only an absent/non-numeric value means we have
+      // no price fact for this model at all. Presets treat 0 as the
+      // cheapest possible price rather than excluding the model.
+      inputCostPerToken: typeof cost === "number" ? cost : undefined,
       supportsXhigh: flag(info.supports_xhigh_reasoning_effort) ?? flag(info.supports_max_reasoning_effort),
       supportsHigh: flag(info.supports_high_reasoning_effort),
       supportsMedium: flag(info.supports_medium_reasoning_effort),
@@ -338,8 +342,98 @@ const PRESET_EFFORT: Record<string, Record<RoleClass, ThinkingLevel>> = {
   quality: { deep: "xhigh", standard: "high", light: "medium" },
 };
 
+/**
+ * Fixed model tiers, explicitly curated instead of derived from a
+ * cost-percentile scan of the whole gateway catalog. A pure percentile scan
+ * over the real gateway catalog kept landing on outdated same-family
+ * siblings or on gateway-confirmed free/non-reasoning models for lighter
+ * roles -- neither is what "cheap/balanced/quality" is meant to promise.
+ * Each tier pairs one Claude-family id with one Codex-family id at a
+ * comparable capability/price point; buildPresetPlan() below picks the
+ * Claude side for "deep" roles and the Codex side for "standard"/"light"
+ * roles. IDs are RAW gateway ids (matched against CatalogEntry.id, same as
+ * pickModelByCost) -- never Pi-provider-qualified here.
+ */
+const MODEL_TIERS = {
+  t1: { claude: "claude-haiku-4-5", codex: "codex-gpt56-luna" },
+  t2: { claude: "claude-sonnet-5", codex: "codex-gpt56-terra" },
+  t3: { claude: "claude-opus-5", codex: "codex-gpt56-sol" },
+  t4: { claude: "claude-fable-5-1", codex: "codex-gpt6-astra" },
+} as const;
+type ModelTier = keyof typeof MODEL_TIERS;
+
+/**
+ * Tier assigned to each (preset, role class) combination. cheap always uses
+ * the lightest tier for every role class. balanced and quality step light
+ * roles down one tier from standard, and standard one tier down from deep,
+ * so a heavier preset never assigns a lighter role the SAME tier as a
+ * deeper one, while still never handing a light role something as heavy as
+ * a deep role's tier.
+ */
+const PRESET_TIER: Record<string, Record<RoleClass, ModelTier>> = {
+  cheap: { deep: "t1", standard: "t1", light: "t1" },
+  balanced: { deep: "t3", standard: "t2", light: "t1" },
+  quality: { deep: "t4", standard: "t3", light: "t2" },
+};
+
+/**
+ * Split a model id into a "family" prefix and a trailing numeric version,
+ * e.g. "claude-opus-4-6" -> ("claude-opus", [4, 6]) and "claude-sonnet-5" ->
+ * ("claude-sonnet", [5]). Only PURELY numeric trailing hyphen-segments count
+ * as version components -- this deliberately stops at the first
+ * non-numeric segment scanning from the right, so tier/size names that
+ * happen to end in digits ("codex-gpt56-terra", "deepseek-v4-pro",
+ * "nemotron-3-ultra") are NOT mistaken for version suffixes and keep their
+ * full id as their own family (no collapsing across genuinely different
+ * models). An id with no trailing numeric segment at all is its own
+ * one-member family with an empty version (never grouped with anything).
+ */
+function parseVersionedFamily(id: string): { family: string; version: number[] } {
+  const segments = id.split("-");
+  const version: number[] = [];
+  let i = segments.length - 1;
+  while (i > 0 && /^\d+(\.\d+)?$/.test(segments[i])) {
+    version.unshift(Number(segments[i]));
+    i--;
+  }
+  if (version.length === 0) return { family: id, version: [] };
+  return { family: segments.slice(0, i + 1).join("-"), version };
+}
+
+function compareVersions(a: number[], b: number[]): number {
+  const len = Math.max(a.length, b.length);
+  for (let i = 0; i < len; i++) {
+    const diff = (a[i] ?? 0) - (b[i] ?? 0);
+    if (diff !== 0) return diff;
+  }
+  return 0;
+}
+
+/**
+ * Collapse a catalog down to the latest version within each detected
+ * versioned family (see parseVersionedFamily), so a preset never assigns an
+ * outdated sibling (e.g. "claude-opus-4-6") when a newer one in the same
+ * family ("claude-opus-5") is available at any price. Entries whose id has
+ * no purely-numeric trailing version segment are each their own family and
+ * always survive unchanged.
+ */
+function collapseToLatestPerFamily(catalog: CatalogEntry[]): CatalogEntry[] {
+  const latest = new Map<string, { entry: CatalogEntry; version: number[] }>();
+  for (const entry of catalog) {
+    const { family, version } = parseVersionedFamily(entry.id);
+    const current = latest.get(family);
+    if (!current || compareVersions(version, current.version) > 0) {
+      latest.set(family, { entry, version });
+    }
+  }
+  return [...latest.values()].map((v) => v.entry);
+}
+
 function pickModelByCost(catalog: CatalogEntry[], percentile: number, requireReasoning: boolean): CatalogEntry | undefined {
-  const pool = catalog.filter((m) => m.inputCostPerToken !== undefined && (!requireReasoning || m.reasoning));
+  const priced = catalog.filter((m) => m.inputCostPerToken !== undefined && (!requireReasoning || m.reasoning));
+  // Never let an outdated same-family model absorb a percentile slot ahead
+  // of (or instead of) its own newer sibling.
+  const pool = collapseToLatestPerFamily(priced);
   if (pool.length === 0) return undefined;
   const sorted = [...pool].sort((a, b) => (a.inputCostPerToken ?? 0) - (b.inputCostPerToken ?? 0));
   const index = Math.min(sorted.length - 1, Math.max(0, Math.round((sorted.length - 1) * percentile)));
@@ -400,23 +494,47 @@ function clampEffort(effort: ThinkingLevel, model: CatalogEntry | undefined): Th
   return "off";
 }
 
+/**
+ * Resolve one fixed tier's Claude/Codex id against the live catalog. A tier
+ * id absent from the current gateway catalog (e.g. temporarily delisted)
+ * returns undefined rather than inventing a substitute -- the caller decides
+ * whether that is fatal for this role class.
+ */
+function resolveTierModel(catalog: CatalogEntry[], tier: ModelTier, side: "claude" | "codex"): CatalogEntry | undefined {
+  const id = MODEL_TIERS[tier][side];
+  return catalog.find((m) => m.id === id);
+}
+
 function buildPresetPlan(preset: string, catalog: CatalogEntry[], roles: ResolvedRole[]): PresetPlanEntry[] | string {
-  const percentile = preset === "cheap" ? 0.15 : preset === "balanced" ? 0.5 : 0.9;
-  // Deep roles REQUIRE a reasoning-capable model -- no non-reasoning fallback.
-  // Standard/light roles prefer one but do not require it.
-  const deepModel = pickModelByCost(catalog, percentile, true);
-  const standardModel = pickModelByCost(catalog, percentile, false);
-  const lightModel = pickModelByCost(catalog, Math.min(percentile, 0.15), false);
-  if (!standardModel || !lightModel) {
-    return "The gateway did not expose usable pricing data (/model/info) — presets need real costs to pick models. Check that the gateway is reachable and exposes input_cost_per_token.";
-  }
-  if (!deepModel) {
-    return "No reasoning-capable model with pricing data was found at this tier — deep roles (proposal/design/verify/review/judge) cannot be assigned without silently dropping reasoning. Add a modelOverride confirming reasoning for at least one model, or adjust the preset tier.";
-  }
+  const tierByClass = PRESET_TIER[preset];
+  if (!tierByClass) return `Unknown preset "${preset}".`;
+
   const plans: PresetPlanEntry[] = [];
   for (const role of roles) {
     const roleClass = classifyRole(role.name);
-    const model = roleClass === "deep" ? deepModel : roleClass === "standard" ? standardModel : lightModel;
+    const tier = tierByClass[roleClass];
+    // Claude for deep roles (judgment/review-heavy), Codex for standard/light
+    // (execution-heavy) -- fixed by design, not derived from pricing.
+    const side = roleClass === "deep" ? "claude" : "codex";
+    const model = resolveTierModel(catalog, tier, side);
+    if (!model) {
+      return (
+        `Preset "${preset}" needs "${MODEL_TIERS[tier][side]}" (tier ${tier}, ${side} side) for ` +
+        `${roleClass} roles, but the gateway catalog does not currently list it. ` +
+        `Check the gateway's /model/info, or add a modelOverride for it.`
+      );
+    }
+    // Deep roles REQUIRE a reasoning-capable model -- the fixed tiers are all
+    // reasoning-capable by curation, but a stale/misconfigured gateway entry
+    // could still report reasoning:false; never silently drop reasoning for
+    // a deep role in that case.
+    if (roleClass === "deep" && !model.reasoning) {
+      return (
+        `Preset "${preset}"'s deep-role model "${model.id}" is not gateway-confirmed reasoning-capable ` +
+        `right now -- refusing to assign a deep role (proposal/design/verify/review/judge/research) ` +
+        `a model without confirmed reasoning.`
+      );
+    }
     const wanted = PRESET_EFFORT[preset][roleClass];
     const effort = clampEffort(wanted, model);
     plans.push({
@@ -781,16 +899,26 @@ export default function modelConfigExtension(pi: ExtensionAPI): void {
 // these exist so tests can exercise the real implementation.
 export {
   THINKING_LEVELS,
+  MODEL_TIERS,
+  PRESET_TIER,
   classifyRole,
   clampEffort,
   buildPresetPlan,
+  collapseToLatestPerFamily,
+  compareVersions,
   discoverAgentDefinitions,
+  fetchCatalog,
   loadSubagentsConfig,
   parseFrontmatterScalars,
+  parseVersionedFamily,
   pickModelByCost,
   providerQualifiedModelId,
   resolveGatewayConfig,
   resolveRoles,
+  resolveTierModel,
+  saveSubagentsConfig,
   stripProviderPrefix,
+  subagentsJsonPath,
   supportFlag,
 };
+export type { CatalogEntry, PresetPlanEntry, ResolvedRole, RoleProfile, SubagentsConfig, ThinkingLevel };

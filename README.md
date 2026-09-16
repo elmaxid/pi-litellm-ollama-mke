@@ -15,7 +15,8 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 - **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides.
 - **Cost Tracking** — Uses the gateway's `x-litellm-response-cost` header or `/model/info` pricing to replace Pi's static cost calculation for `ollama-mke` requests.
 - **Session Grouping** — Adds `litellm_session_id` to outbound requests so calls from one Pi session are grouped in LiteLLM gateway logs.
-- **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by the gateway's real pricing and capability data.
+- **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by fixed model tiers.
+- **Automatic Role Sync** — Runs the same preset logic as `/roles`' "Apply preset" automatically on every Pi startup and `/reload`, so newly discovered agent roles get a model/effort profile without a manual `/roles` visit. Ownership-aware and off by default for hand-configured roles; see [Automatic Role Sync](#automatic-role-sync).
 
 ## Installation
 
@@ -78,11 +79,32 @@ What it can do:
 - **View / edit roles** — lists every discovered role (agent `.md` definitions plus existing `model_profiles` entries) with its *effective* model and effort, where the value comes from (`model_profiles` beat agent frontmatter, which beats the defaults), and its **ownership status**: `[managed by preset]` (a prior preset wrote it and nothing has changed since), `[custom]` (you set it, or it predates ownership tracking), or `[stale-managed — edited since last preset]` (a preset wrote it once, but it was hand-edited afterward). No tag means the role has no explicit profile yet (fully inherited).
 - **Change a role's model or effort** — pick from the live gateway catalog (marked with `[R]` for reasoning support and per-million input cost); efforts span `off, minimal, low, medium, high, xhigh`. A role's profile can also be cleared so it inherits again. Any manual edit here always marks the role `custom` (even if a preset had written it before) — hand-editing a role is always your decision, and a later preset run will never overwrite it silently.
 - **Defaults** — edit `default_model` and `default_effort`.
-- **Apply preset** — `cheap`, `balanced`, or `quality` reassigns eligible roles at once. The preset picks real models from the gateway's `/model/info` pricing (15th/50th/90th cost percentile), lightens roles like sync/archive/status, and clamps the requested effort to what the chosen model actually supports (`supports_*_reasoning_effort`). Deep roles (proposal, design, verify, review…) **require** a gateway-confirmed reasoning-capable model at that price tier; if none exists, the preset refuses to run rather than silently assigning reasoning effort to a non-reasoning model. **Ownership-aware**: a preset only ever touches roles that are unset or still match what a prior preset wrote; any role marked `custom` or `stale-managed` is skipped and listed by name in the summary — presets never overwrite a hand-configured role.
+- **Apply preset** — `cheap`, `balanced`, or `quality` reassigns eligible roles at once, using the fixed model tiers below (not a cost-percentile scan of the whole catalog). Deep roles (proposal, design, verify, review, judge, research) always get the Claude side of their tier; standard/light roles get the Codex side. Deep roles **require** a gateway-confirmed reasoning-capable model; if the tier's model is not currently confirmed reasoning-capable, or is missing from the live catalog, the preset refuses to run for that role class rather than silently assigning a non-reasoning model or inventing a substitute. **Ownership-aware**: a preset only ever touches roles that are unset or still match what a prior preset wrote; any role marked `custom` or `stale-managed` is skipped and listed by name in the summary — presets never overwrite a hand-configured role.
 
 Capability facts come only from the gateway (`/model/info` `supports_reasoning` / `supports_*_reasoning_effort`) or an explicit `modelOverrides` entry — never from guessing off a model's name. A flag the gateway does not publish is treated as *unknown*, not as *supported*: `/roles` will not promise an effort level the backend never confirmed, and manually setting a role's effort is rejected (with an explanation) when the selected model's catalog entry explicitly denies that level or lacks confirmed reasoning.
 
 Every write shows a summary first, creates a timestamped `subagents.json.bak-*` backup, and preserves any unknown keys already in the file. Changes apply to agents launched afterwards.
+
+#### Fixed model tiers
+
+Instead of scanning the whole gateway catalog by cost percentile (which kept landing on outdated same-family model versions, or on gateway-confirmed free/non-reasoning models for lighter roles), presets pick from four explicitly curated tiers. Each tier pairs one Claude-family model with one Codex-family model at a comparable capability point:
+
+| Tier | Claude side | Codex side |
+| --- | --- | --- |
+| T1 (lightest) | `claude-haiku-4-5` | `codex-gpt56-luna` |
+| T2 (standard) | `claude-sonnet-5` | `codex-gpt56-terra` |
+| T3 (high) | `claude-opus-5` | `codex-gpt56-sol` |
+| T4 (top) | `claude-fable-5-1` | `codex-gpt6-astra` |
+
+Preset → tier mapping per role class:
+
+| Preset | deep | standard | light |
+| --- | --- | --- | --- |
+| `cheap` | T1 | T1 | T1 |
+| `balanced` | T3 | T2 | T1 |
+| `quality` | T4 | T3 | T2 |
+
+Deep roles always resolve to the tier's Claude-side id; standard and light roles resolve to the Codex-side id. These ids are curated for this gateway's catalog — if your gateway's catalog uses different model names, edit `MODEL_TIERS` in `extensions/model-config.ts` (also used by `extensions/role-sync.ts`).
 
 ```json
 {
@@ -124,6 +146,17 @@ A gateway model id like `bedrock/claude-sonnet-4.6` already contains a `/` from 
 `extensions/role-ownership.ts` adds a sidecar at `~/.pi/agent/gentle-ai/role-profiles.json` that records which `model_profiles` entries `/roles`' "Apply preset" last wrote (`managed`), versus profiles that already existed or were hand-edited since (`custom` / `stale-managed`). It never becomes the source of truth — `subagents.json` stays authoritative — and it never overwrites a profile it did not itself record writing.
 
 Both `/roles` views use it: "View / edit roles" shows each role's ownership status, and "Apply preset" only writes roles that are unset or still `managed`, skipping `custom`/`stale-managed` roles and listing them in the summary. Any manual model/effort edit through `/roles` immediately marks that role `custom`, so a later preset never re-adopts it without an explicit human action first. Global scope only for now; project-scoped `<cwd>/.pi/subagents.json` profiles are explicitly out of scope until a later phase.
+
+## Automatic Role Sync
+
+`extensions/role-sync.ts` runs the exact same preset logic as `/roles`' "Apply preset" automatically on every Pi startup and `/reload` (the `session_start` event), so agent roles installed later (by `gentle-ai sync`, a project's `.pi/agents`, etc.) get a model/effort profile without a manual `/roles` visit.
+
+- **Default preset**: `balanced`. Override with `OLLAMA_MKE_ROLE_SYNC_PRESET=cheap|balanced|quality`.
+- **Disable entirely**: `OLLAMA_MKE_ROLE_SYNC=off`.
+- **Same safety guarantees as a manual "Apply preset" run**: ownership-aware (never touches a `custom`/`stale-managed` role), deep roles require a gateway-confirmed reasoning-capable model (skips rather than degrading silently), timestamped `subagents.json.bak-*` backup before every write, and unknown keys preserved.
+- **Never blocks startup**: every failure mode (gateway unreachable, no usable tier model, corrupt config) logs a warning and skips this pass; it never throws out of `session_start`.
+
+Run `/roles` afterward to review what was assigned, or to hand-edit any role — a manual edit through `/roles` always disowns that role, so the next automatic pass leaves it alone.
 
 ## Seeing only ollama-mke in `/model` or `--list-models`
 

@@ -156,31 +156,166 @@ describe("pure logic", () => {
     expect(ext.supportFlag(model, "xhigh")).toBeUndefined();
   });
 
-  test("percentile picking and full preset plans", () => {
+  test("pickModelByCost: still usable as a standalone cost-percentile helper (no longer used by buildPresetPlan)", () => {
+    // Ids deliberately do NOT end in a bare numeric segment ("model-a", not
+    // "model-0") so they are not mistaken for versioned siblings of one
+    // family by collapseToLatestPerFamily -- that behavior gets its own
+    // dedicated test below.
+    const letters = "abcdefghij";
     const catalog = Array.from({ length: 10 }, (_, i) => ({
-      id: `model-${i}`, reasoning: i >= 5, inputCostPerToken: (i + 1) / 1e6,
+      id: `model-${letters[i]}`, reasoning: i >= 5, inputCostPerToken: (i + 1) / 1e6,
       supportsXhigh: i % 2 === 0, supportsLow: true, supportsMinimal: true, supportsNone: true,
     }));
-    expect(ext.pickModelByCost(catalog, 0, false)?.id).toBe("model-0");
-    expect(ext.pickModelByCost(catalog, 1, false)?.id).toBe("model-9");
-    expect(ext.pickModelByCost(catalog, 0.15, true)?.id).toBe("model-6");
+    expect(ext.pickModelByCost(catalog, 0, false)?.id).toBe("model-a");
+    expect(ext.pickModelByCost(catalog, 1, false)?.id).toBe("model-j");
+    expect(ext.pickModelByCost(catalog, 0.15, true)?.id).toBe("model-g");
     expect(ext.pickModelByCost(catalog.filter((m) => !m.reasoning), 0.5, true)).toBeUndefined();
-    const roles = [{ name: "sdd-proposal" }, { name: "sdd-archive" }] as any;
-    for (const preset of ["cheap", "balanced", "quality"] as const) {
-      const plan = ext.buildPresetPlan(preset, catalog, roles) as any[];
-      expect(plan.length).toBe(2);
-      expect(catalog.find((m) => m.id === plan[0].model)?.reasoning).toBe(true);
-    }
   });
 
-  test("buildPresetPlan: no reasoning-capable priced model -> error string, never a silent non-reasoning fallback for deep roles", () => {
-    const noReasoningCatalog = Array.from({ length: 5 }, (_, i) => ({
-      id: `plain-${i}`, reasoning: false, inputCostPerToken: (i + 1) / 1e6,
+  /**
+   * Full 8-id fixed-tier catalog mirroring MODEL_TIERS exactly, so
+   * buildPresetPlan tests exercise the real tier table without depending on
+   * a live gateway. Every id is reasoning-capable and confirms medium/high/
+   * xhigh so clampEffort never silently degrades these fixtures.
+   */
+  function fixedTierCatalog(): any[] {
+    const ids = [
+      "claude-haiku-4-5", "codex-gpt56-luna",
+      "claude-sonnet-5", "codex-gpt56-terra",
+      "claude-opus-5", "codex-gpt56-sol",
+      "claude-fable-5-1", "codex-gpt6-astra",
+    ];
+    return ids.map((id) => ({
+      id, reasoning: true, inputCostPerToken: 1e-6,
+      supportsMedium: true, supportsHigh: true, supportsXhigh: true,
     }));
+  }
+
+  test("buildPresetPlan: fixed tiers -- Claude side for deep roles, Codex side for standard/light", () => {
+    const catalog = fixedTierCatalog();
+    const roles = [{ name: "sdd-proposal" }, { name: "gentle-ai-worker" }, { name: "sdd-archive" }] as any;
+
+    const cheap = ext.buildPresetPlan("cheap", catalog, roles) as any[];
+    expect(cheap.find((p) => p.role === "sdd-proposal")?.model).toBe("claude-haiku-4-5");
+    expect(cheap.find((p) => p.role === "gentle-ai-worker")?.model).toBe("codex-gpt56-luna");
+    expect(cheap.find((p) => p.role === "sdd-archive")?.model).toBe("codex-gpt56-luna");
+
+    const balanced = ext.buildPresetPlan("balanced", catalog, roles) as any[];
+    expect(balanced.find((p) => p.role === "sdd-proposal")?.model).toBe("claude-opus-5");
+    expect(balanced.find((p) => p.role === "gentle-ai-worker")?.model).toBe("codex-gpt56-terra");
+    expect(balanced.find((p) => p.role === "sdd-archive")?.model).toBe("codex-gpt56-luna");
+
+    const quality = ext.buildPresetPlan("quality", catalog, roles) as any[];
+    expect(quality.find((p) => p.role === "sdd-proposal")?.model).toBe("claude-fable-5-1");
+    expect(quality.find((p) => p.role === "gentle-ai-worker")?.model).toBe("codex-gpt56-sol");
+    expect(quality.find((p) => p.role === "sdd-archive")?.model).toBe("codex-gpt56-terra");
+  });
+
+  test("buildPresetPlan: an outdated same-family sibling in the catalog never displaces its tier's exact fixed id", () => {
+    // Even with a stale "claude-opus-4-6" sitting in the catalog (cheaper, so
+    // it would have won a percentile scan), buildPresetPlan must still
+    // resolve the exact tier id ("claude-opus-5"), not the stale sibling.
+    const catalog = [
+      ...fixedTierCatalog(),
+      { id: "claude-opus-4-6", reasoning: true, inputCostPerToken: 1e-7 },
+    ];
     const roles = [{ name: "sdd-proposal" }] as any;
-    const result = ext.buildPresetPlan("balanced", noReasoningCatalog, roles);
+    const balanced = ext.buildPresetPlan("balanced", catalog, roles) as any[];
+    expect(balanced[0].model).toBe("claude-opus-5");
+  });
+
+  test("parseVersionedFamily: only purely-numeric trailing hyphen segments count as a version", () => {
+    expect(ext.parseVersionedFamily("claude-opus-4-6")).toEqual({ family: "claude-opus", version: [4, 6] });
+    expect(ext.parseVersionedFamily("claude-sonnet-5")).toEqual({ family: "claude-sonnet", version: [5] });
+    // Tier/size names that happen to end in digits are NOT version suffixes:
+    // each keeps its own full id as a one-member family.
+    expect(ext.parseVersionedFamily("codex-gpt56-terra")).toEqual({ family: "codex-gpt56-terra", version: [] });
+    expect(ext.parseVersionedFamily("nemotron-3-ultra")).toEqual({ family: "nemotron-3-ultra", version: [] });
+    expect(ext.parseVersionedFamily("deepseek-v4-pro")).toEqual({ family: "deepseek-v4-pro", version: [] });
+    // No trailing hyphen segment at all -> its own one-member family.
+    expect(ext.parseVersionedFamily("gemma4")).toEqual({ family: "gemma4", version: [] });
+  });
+
+  test("compareVersions: lexicographic-by-component, shorter treated as zero-padded", () => {
+    expect(ext.compareVersions([4, 6], [4, 7])).toBeLessThan(0);
+    expect(ext.compareVersions([4, 8], [5])).toBeLessThan(0);
+    expect(ext.compareVersions([5], [5])).toBe(0);
+    expect(ext.compareVersions([5, 1], [5])).toBeGreaterThan(0);
+  });
+
+  test("collapseToLatestPerFamily: keeps only the newest sibling within a real gateway catalog's versioned families", () => {
+    // Fixture mirrors the actual shape of the gateway's opus/sonnet lineup:
+    // several priced opus siblings (older ones costing the same or more than
+    // the newest), plus a sonnet family where the OLDER one costs MORE than
+    // the newer one -- exactly the case that broke pure cost-percentile
+    // picking (it would have ranked the stale sonnet-4-6 above sonnet-5).
+    const catalog = [
+      { id: "claude-opus-4-6", reasoning: true, inputCostPerToken: 5e-6 },
+      { id: "claude-opus-4-7", reasoning: true, inputCostPerToken: 5e-6 },
+      { id: "claude-opus-4-8", reasoning: true, inputCostPerToken: 5e-6 },
+      { id: "claude-opus-5", reasoning: true, inputCostPerToken: 5e-6 },
+      { id: "claude-sonnet-4-6", reasoning: true, inputCostPerToken: 3e-6 },
+      { id: "claude-sonnet-5", reasoning: true, inputCostPerToken: 2e-6 },
+      { id: "codex-gpt56-terra", reasoning: true, inputCostPerToken: 2e-6 },
+    ] as any;
+    const collapsed = ext.collapseToLatestPerFamily(catalog);
+    const ids = collapsed.map((m: any) => m.id).sort();
+    // Every claude-opus-4-* sibling is gone; only the newest (5) remains.
+    expect(ids).not.toContain("claude-opus-4-6");
+    expect(ids).not.toContain("claude-opus-4-7");
+    expect(ids).not.toContain("claude-opus-4-8");
+    expect(ids).toContain("claude-opus-5");
+    // The stale, more expensive sonnet-4-6 is gone; only sonnet-5 remains,
+    // even though it is cheaper (version wins over cost when collapsing).
+    expect(ids).not.toContain("claude-sonnet-4-6");
+    expect(ids).toContain("claude-sonnet-5");
+    // A non-versioned id (tier name ending in digits) is untouched.
+    expect(ids).toContain("codex-gpt56-terra");
+    expect(ids.length).toBe(3);
+  });
+
+  test("pickModelByCost never selects a stale same-family sibling over its newer version", () => {
+    // claude-opus-4-6 is cheaper than claude-opus-5 here, so pure
+    // cost-percentile picking without family collapsing would pick the
+    // stale one first. With collapsing, only opus-5 is ever a candidate.
+    const catalog = [
+      { id: "claude-opus-4-6", reasoning: true, inputCostPerToken: 1e-6 },
+      { id: "claude-opus-5", reasoning: true, inputCostPerToken: 5e-6 },
+    ] as any;
+    expect(ext.pickModelByCost(catalog, 0, true)?.id).toBe("claude-opus-5");
+    expect(ext.pickModelByCost(catalog, 1, true)?.id).toBe("claude-opus-5");
+  });
+
+  test("pickModelByCost treats a gateway-confirmed zero price as a real (cheapest) price, not as missing", () => {
+    const catalog = [
+      { id: "free-local-model", reasoning: false, inputCostPerToken: 0 },
+      { id: "paid-model", reasoning: false, inputCostPerToken: 5e-6 },
+    ] as any;
+    expect(ext.pickModelByCost(catalog, 0, false)?.id).toBe("free-local-model");
+    // A model with no price fact at all (undefined) must still be excluded.
+    const withUnknown = [...catalog, { id: "unknown-price", reasoning: false, inputCostPerToken: undefined }] as any;
+    expect(ext.pickModelByCost(withUnknown, 0, false)?.id).toBe("free-local-model");
+  });
+
+  test("buildPresetPlan: a tier id missing from the current gateway catalog -> error string, never a silent substitute", () => {
+    // Catalog has 7 of the 8 fixed-tier ids but is missing balanced/deep's
+    // "claude-opus-5" -- buildPresetPlan must refuse rather than pick a
+    // nearby stand-in on its own.
+    const catalog = fixedTierCatalog().filter((m) => m.id !== "claude-opus-5");
+    const roles = [{ name: "sdd-proposal" }] as any;
+    const result = ext.buildPresetPlan("balanced", catalog, roles);
     expect(typeof result).toBe("string");
-    expect(result as string).toMatch(/reasoning-capable model/i);
+    expect(result as string).toContain("claude-opus-5");
+  });
+
+  test("buildPresetPlan: a tier id present but not gateway-confirmed reasoning-capable refuses a deep role rather than silently dropping reasoning", () => {
+    const catalog = fixedTierCatalog().map((m) =>
+      m.id === "claude-fable-5-1" ? { ...m, reasoning: false } : m
+    );
+    const roles = [{ name: "sdd-proposal" }] as any; // deep -> quality tier t4 -> claude-fable-5-1
+    const result = ext.buildPresetPlan("quality", catalog, roles);
+    expect(typeof result).toBe("string");
+    expect(result as string).toMatch(/reasoning-capable/i);
   });
 });
 
@@ -265,16 +400,24 @@ describe("e2e /roles ownership integration", () => {
 
   // Minimal reasoning-capable catalog served in place of a real gateway, so
   // "Apply preset" can be exercised end-to-end without network access.
+  // Includes every fixed-tier id buildPresetPlan needs to resolve any
+  // preset/role-class combination used below, so "Apply preset" can run
+  // end-to-end against the real tier table without a live gateway.
   const modelInfoPayload = {
     data: [
-      {
-        model_name: "deep-model",
-        model_info: { supports_reasoning: true, input_cost_per_token: 0.000002, supports_xhigh_reasoning_effort: true },
-      },
-      {
-        model_name: "cheap-model",
-        model_info: { supports_reasoning: false, input_cost_per_token: 0.0000001 },
-      },
+      { model_name: "claude-haiku-4-5", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_medium_reasoning_effort: true } },
+      { model_name: "codex-gpt56-luna", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_high_reasoning_effort: true } },
+      { model_name: "claude-sonnet-5", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_high_reasoning_effort: true } },
+      { model_name: "codex-gpt56-terra", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_medium_reasoning_effort: true } },
+      { model_name: "claude-opus-5", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_high_reasoning_effort: true } },
+      { model_name: "codex-gpt56-sol", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_high_reasoning_effort: true } },
+      { model_name: "claude-fable-5-1", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_xhigh_reasoning_effort: true } },
+      { model_name: "codex-gpt6-astra", model_info: { supports_reasoning: true, input_cost_per_token: 1e-6, supports_xhigh_reasoning_effort: true } },
+      // Kept alongside the tier ids for tests that pre-seed a hand-picked
+      // profile with a synthetic id outside the fixed tiers (custom-profile
+      // paths never need to resolve against the catalog).
+      { model_name: "deep-model", model_info: { supports_reasoning: true, input_cost_per_token: 2e-6, supports_xhigh_reasoning_effort: true } },
+      { model_name: "cheap-model", model_info: { supports_reasoning: false, input_cost_per_token: 1e-7 } },
     ],
   };
   let originalFetch: typeof fetch;
