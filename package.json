@@ -17,7 +17,8 @@
   },
   "pi": {
     "extensions": [
-      "./extensions"
+      "./extensions",
+      "!./extensions/role-ownership.ts"
     ]
   },
   "peerDependencies": {
