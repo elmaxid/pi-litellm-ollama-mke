@@ -16,7 +16,7 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 - **Cost Tracking** — Uses the gateway's `x-litellm-response-cost` header or `/model/info` pricing to replace Pi's static cost calculation for `ollama-mke` requests.
 - **Session Grouping** — Adds `litellm_session_id` to outbound requests so calls from one Pi session are grouped in LiteLLM gateway logs.
 - **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by fixed model tiers.
-- **Automatic Role Sync** — Runs the same preset logic as `/roles`' "Apply preset" automatically on every Pi startup and `/reload`, so newly discovered agent roles get a model/effort profile without a manual `/roles` visit. Ownership-aware and off by default for hand-configured roles; see [Automatic Role Sync](#automatic-role-sync).
+- **Automatic Role Sync** — Optional (off by default, `OLLAMA_MKE_ROLE_SYNC=on` to enable) — runs the same preset logic as /roles' "Apply preset" automatically on every Pi startup and /reload, so newly discovered agent roles get a model/effort profile without a manual /roles visit. Ownership-aware; a harness like gentle-ai/gentle-pi is often the routing authority instead, which is why this defaults off. See [Automatic Role Sync](#automatic-role-sync).
 
 ## Installation
 
@@ -149,14 +149,16 @@ Both `/roles` views use it: "View / edit roles" shows each role's ownership stat
 
 ## Automatic Role Sync
 
-`extensions/role-sync.ts` runs the exact same preset logic as `/roles`' "Apply preset" automatically on every Pi startup and `/reload` (the `session_start` event), so agent roles installed later (by `gentle-ai sync`, a project's `.pi/agents`, etc.) get a model/effort profile without a manual `/roles` visit.
+`extensions/role-sync.ts` can run the exact same preset logic as `/roles`' "Apply preset" automatically on every Pi startup and `/reload` (the `session_start` event), so agent roles installed later (by `gentle-ai sync`, a project's `.pi/agents`, etc.) get a model/effort profile without a manual `/roles` visit.
 
+**Off by default.** On a shared team install, a harness such as [gentle-pi](https://github.com/Gentleman-Programming/gentle-pi) is frequently already the authority for role → model routing: it persists its own routing (e.g. `~/.pi/gentle-ai/models.json`) and reapplies it on every `session_start`, writing the same `subagents.json` this extension would touch. Two auto-appliers racing to own the same file on every startup is exactly the kind of silent config drift a shared install cannot afford — most operators on a team install have not asked for this extension's routing opinion, so it stays inert unless explicitly turned on.
+
+- **Enable**: `OLLAMA_MKE_ROLE_SYNC=on`.
 - **Default preset**: `balanced`. Override with `OLLAMA_MKE_ROLE_SYNC_PRESET=cheap|balanced|quality`.
-- **Disable entirely**: `OLLAMA_MKE_ROLE_SYNC=off`.
 - **Same safety guarantees as a manual "Apply preset" run**: ownership-aware (never touches a `custom`/`stale-managed` role), deep roles require a gateway-confirmed reasoning-capable model (skips rather than degrading silently), timestamped `subagents.json.bak-*` backup before every write, and unknown keys preserved.
 - **Never blocks startup**: every failure mode (gateway unreachable, no usable tier model, corrupt config) logs a warning and skips this pass; it never throws out of `session_start`.
 
-Run `/roles` afterward to review what was assigned, or to hand-edit any role — a manual edit through `/roles` always disowns that role, so the next automatic pass leaves it alone.
+If your team's routing authority is gentle-ai/gentle-pi (`/gentle:models`, `/gentle:profiles`), leave this off and let this package do only what it does unconditionally: keep the `ollama-mke` model catalog (`extensions/litellm-sync.ts`) in sync with the gateway, so gentle-ai always has the current model list to route to. Only opt in here on an install where this package itself is meant to own role routing; running `/roles` afterward still works the same way to review or hand-edit any role.
 
 ## Seeing only ollama-mke in `/model` or `--list-models`
 

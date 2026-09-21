@@ -32,7 +32,14 @@
  *
  * Configuration:
  *   OLLAMA_MKE_ROLE_SYNC_PRESET=cheap|balanced|quality (default: "balanced")
- *   OLLAMA_MKE_ROLE_SYNC=off disables this extension entirely.
+ *   OLLAMA_MKE_ROLE_SYNC=on enables this extension. It is OFF BY DEFAULT: a
+ *   harness like gentle-ai/gentle-pi may already be the source of truth for
+ *   role -> model routing (its own config, e.g. gentle-ai's models.json,
+ *   reapplied on every session_start). This extension writing subagents.json
+ *   at the same time would silently fight that authority for every operator
+ *   who has not explicitly asked for this auto-sync -- across a shared team
+ *   install, most have not. Opt in only where this extension is meant to be
+ *   the routing authority instead.
  */
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
@@ -85,7 +92,11 @@ async function syncRoles(cwd: string): Promise<void> {
 }
 
 async function syncRolesInner(cwd: string): Promise<void> {
-  if ((process.env.OLLAMA_MKE_ROLE_SYNC ?? "").toLowerCase() === "off") return;
+  // Opt-in, not opt-out: a shared team install may have a harness (e.g.
+  // gentle-ai/gentle-pi) that already owns role -> model routing via its own
+  // reapplied config. This extension must not write subagents.json unless an
+  // operator explicitly asks for it here.
+  if ((process.env.OLLAMA_MKE_ROLE_SYNC ?? "").toLowerCase() !== "on") return;
 
   const preset = resolvePreset();
 
