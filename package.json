@@ -17,8 +17,11 @@
   },
   "pi": {
     "extensions": [
-      "./extensions",
-      "!./extensions/role-ownership.ts"
+      "./extensions/litellm-cost.ts",
+      "./extensions/litellm-session.ts",
+      "./extensions/litellm-sync.ts",
+      "./extensions/model-config.ts",
+      "./extensions/role-sync.ts"
     ]
   },
   "peerDependencies": {
