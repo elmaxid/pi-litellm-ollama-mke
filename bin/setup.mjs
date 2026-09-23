@@ -193,6 +193,26 @@ async function main() {
     api: "openai-completions",
   };
 
+  // Keep the model picker (/model) and cycling (Ctrl+P) open to every
+  // gateway model, including ones added after this setup ran. Without this,
+  // Pi's own enabledModels filter in settings.json defaults to "everything"
+  // when absent, but a prior manual /scoped-models selection or an older
+  // setup run could have left it as a closed list that silently hides new
+  // gateway models. Only set it when it does not already grant every
+  // ollama-mke model, so we never clobber an existing wildcard or a list a
+  // human already widened themselves; runtime reconciliation in
+  // extensions/litellm-sync.ts also carries this forward on already-installed
+  // configs (see README "Seeing only some ollama-mke models in /model").
+  const currentEnabledModels = Array.isArray(settingsConfig.enabledModels)
+    ? settingsConfig.enabledModels
+    : undefined;
+  const alreadyGrantsAllOllamaMkeModels =
+    currentEnabledModels === undefined ||
+    currentEnabledModels.length === 0 ||
+    currentEnabledModels.includes("ollama-mke/*");
+  const enabledModelsAdded = !alreadyGrantsAllOllamaMkeModels;
+  if (enabledModelsAdded) settingsConfig.enabledModels = ["ollama-mke/*"];
+
   if (!Array.isArray(settingsConfig.packages)) settingsConfig.packages = [];
   const packageAdded = !settingsConfig.packages.includes(options.packageSource);
   if (packageAdded) settingsConfig.packages.push(options.packageSource);
@@ -209,6 +229,11 @@ async function main() {
     packageAdded
       ? `  packages: add ${options.packageSource}`
       : `  packages: ${options.packageSource} already present (no addition)`
+  );
+  console.log(
+    enabledModelsAdded
+      ? '  enabledModels: set to ["ollama-mke/*"] so /model and Ctrl+P always show every gateway model'
+      : "  enabledModels: already allows every ollama-mke model (no change)"
   );
 
   if (!(await confirm(options))) {

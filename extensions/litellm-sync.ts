@@ -22,6 +22,15 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { homedir } from "node:os";
+import {
+  alreadyGrantsAllOllamaMkeModels,
+  computeEnabledModelsStatus,
+  loadEnabledModelsOwnership,
+  readCurrentEnabledModels,
+  recordManagedEnabledModels,
+  saveEnabledModelsOwnership,
+  writeManagedEnabledModels,
+} from "./enabled-models-ownership.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -449,6 +458,56 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
     console.warn(
       `[ollama-mke-sync] No token limits advertised for: ${unresolved.join(", ")}. ` +
         `Using heuristic defaults — set providers["ollama-mke"].modelOverrides in models.json to correct them.`
+    );
+  }
+
+  reconcileEnabledModels();
+}
+
+// ---------------------------------------------------------------------------
+// enabledModels reconciliation
+// ---------------------------------------------------------------------------
+
+/**
+ * Keep settings.json's `enabledModels` from silently hiding newly-synced
+ * gateway models from /model and Ctrl+P cycling. A closed, stale list there
+ * is invisible to the user — the provider registration above is correct,
+ * but Pi still filters the picker against the old list. Ownership-aware
+ * (see enabled-models-ownership.ts): this only ever auto-rewrites a value
+ * this plugin itself wrote before; a hand-curated or pre-existing list is
+ * left untouched and only warned about once per process.
+ */
+function reconcileEnabledModels(): void {
+  try {
+    const current = readCurrentEnabledModels();
+    if (alreadyGrantsAllOllamaMkeModels(current)) return;
+
+    const sidecar = loadEnabledModelsOwnership();
+    const status = computeEnabledModelsStatus(sidecar, current);
+
+    if (status === "custom") {
+      console.warn(
+        `[ollama-mke-sync] settings.json enabledModels is a closed list that does not include "ollama-mke/*" ` +
+          `and was not written by this plugin — leaving it as-is. New gateway models will stay hidden from ` +
+          `/model and Ctrl+P until you add them. To always see every ollama-mke model, add "ollama-mke/*" to ` +
+          `enabledModels in ~/.pi/agent/settings.json.`
+      );
+      return;
+    }
+
+    // status is "unset" (nothing to reconcile — already means "see everything";
+    // guaranteed unreachable here because alreadyGrantsAllOllamaMkeModels()
+    // already returned true for it above) or "managed" (safe to rewrite).
+    const { backupPath, written } = writeManagedEnabledModels();
+    saveEnabledModelsOwnership(recordManagedEnabledModels(sidecar, written));
+    console.log(
+      `[ollama-mke-sync] Reconciled settings.json enabledModels to ["ollama-mke/*"] so new gateway models ` +
+        `stay visible in /model and Ctrl+P.${backupPath ? ` Backup: ${backupPath}` : ""}`
+    );
+  } catch (err) {
+    // Never block model sync or session_start over enabledModels housekeeping.
+    console.warn(
+      `[ollama-mke-sync] Could not reconcile settings.json enabledModels: ${err instanceof Error ? err.message : err}`
     );
   }
 }

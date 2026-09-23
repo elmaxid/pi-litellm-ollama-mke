@@ -12,7 +12,7 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 
 ## Features
 
-- **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides.
+- **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides. It also keeps `enabledModels` in `settings.json` from silently hiding new gateway models from `/model` and cycling — see [Seeing only some ollama-mke models in `/model`](#seeing-only-some-ollama-mke-models-in-model) below.
 - **Cost Tracking** — Uses the gateway's `x-litellm-response-cost` header or `/model/info` pricing to replace Pi's static cost calculation for `ollama-mke` requests.
 - **Session Grouping** — Adds `litellm_session_id` to outbound requests so calls from one Pi session are grouped in LiteLLM gateway logs.
 - **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by fixed model tiers.
@@ -170,6 +170,18 @@ Pi ships several **built-in** providers (OpenAI, Anthropic, OpenRouter, Google, 
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY` → activates the built-in `google` provider
 
 Comment out or remove those exports from `~/.bashrc` (or wherever your shell sets them) if they are not otherwise needed, then open a **new** shell — an already-running shell keeps the environment variables it loaded at startup, so editing the dotfile alone will not affect a session already open. This is unrelated to `providers["ollama-mke"]` in `models.json`, which only ever adds the `ollama-mke` provider and never removes another one.
+
+## Seeing only some ollama-mke models in `/model`
+
+Pi's own `settings.json` has a separate, unrelated filter: `enabledModels` (documented under [Settings](https://pi.dev, see `docs/settings.md#model-cycling`) and driven by the `/scoped-models` command). It controls both the `/model` startup picker and `Ctrl+P` cycling, on top of whatever the provider itself registers. A `models.json` written by an older `bin/setup.mjs`, or a manually curated `/scoped-models` selection, can leave `enabledModels` as a closed list of specific `ollama-mke/<id>` entries. Because that list is static, it silently goes stale every time the gateway adds a new model: the model sync extension (`extensions/litellm-sync.ts`) registers the new id correctly, but `/model` and cycling still filter it out because `enabledModels` never mentions it. The plugin looks broken even though the provider registration is fine.
+
+Every model sync run (startup and `/reload`) now reconciles this automatically, ownership-aware (mirroring `/roles`' preset ownership tracking):
+
+- If `enabledModels` is absent, empty, or already contains the `"ollama-mke/*"` wildcard, nothing is touched — every gateway model is already visible.
+- If `enabledModels` is a closed list that this plugin itself wrote before (tracked in `~/.pi/agent/gentle-ai/enabled-models-ownership.json`), it is automatically rewritten to `["ollama-mke/*"]` so every current and future gateway model stays visible without needing another `/scoped-models` visit. A timestamped `settings.json.bak-*` backup is written first.
+- If `enabledModels` is a closed list this plugin never recorded writing — a hand-curated `/scoped-models` selection, or the output of a `setup.mjs` version older than this feature — it is left untouched. A one-time console warning explains how to add `"ollama-mke/*"` to `enabledModels` in `~/.pi/agent/settings.json` manually if you want every gateway model to stay visible automatically.
+
+This reconciliation ships in the plugin itself, so it reaches every install on the next `pi update` / `/reload` without re-running `bin/setup.mjs` on each workstation. `bin/setup.mjs` also writes the wildcard directly for brand-new installs, so a fresh setup never needs this runtime fallback at all.
 
 ## Local Extension Development
 
