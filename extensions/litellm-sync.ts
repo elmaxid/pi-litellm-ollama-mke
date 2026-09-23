@@ -232,7 +232,7 @@ function gatewayCapabilities(
 
   let anyEffortFlag = false;
   const map: Record<ThinkingLevel, string | null> = {
-    off: "off",
+    off: "none",
     minimal: "minimal",
     low: "low",
     medium: "medium",
