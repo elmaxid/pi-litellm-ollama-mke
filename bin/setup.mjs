@@ -14,6 +14,7 @@ import { fileURLToPath } from "node:url";
 const DEFAULT_PACKAGE_SOURCE = fileURLToPath(new URL("..", import.meta.url)).replace(/\/$/, "");
 
 const usage = `Usage: pi-litellm-ollama-mke [options]
+       pi-litellm-ollama-mke set-thinking --model <id> --level <level> --effort <value> [options]
 
 Configure Pi to use the ollama-mke LiteLLM gateway.
 
@@ -24,6 +25,28 @@ Options:
   --yes                    Apply changes without confirmation
   --package-source <src>   Package source to add to settings.json (default: this package)
   --help                   Show this help message
+
+subcommand: set-thinking
+  Sets or clears one pi thinking level's wire value for one model's
+  modelOverrides.thinkingLevelMap in models.json, without hand-editing JSON.
+  Only the given level changes; every other level the gateway already
+  reports keeps its own value. Survives package updates and /reload —
+  models.json is user config, never overwritten by the extension.
+
+  --model <id>              Raw gateway model id (as returned by /v1/models,
+                             not the Pi-qualified "ollama-mke/<id>" form)
+  --level <lvl>             Pi thinking level to override: off, minimal, low,
+                             medium, high, or xhigh
+  --effort <value|clear>    Wire value LiteLLM expects for that level (e.g.
+                             "medium", "none"), or "clear" to remove this
+                             level's override and let the gateway decide again
+  --scope <user|project>    Configuration scope (default: user)
+  --yes                     Apply without confirmation
+
+  Example — make claude-opus-5-5 default to medium reasoning instead of off:
+    pi-litellm-ollama-mke set-thinking --model claude-opus-5-5 --level off --effort medium
+
+  Then restart Pi or run /reload for the change to take effect.
 `;
 
 function parseArgs(argv) {
@@ -47,6 +70,42 @@ function parseArgs(argv) {
     throw new Error('--scope must be either "user" or "project".');
   }
   return options;
+}
+
+const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh"];
+
+function parseSetThinkingArgs(argv) {
+  const options = { scope: "user", yes: false };
+  for (let index = 0; index < argv.length; index++) {
+    const arg = argv[index];
+    if (arg === "--help") { options.help = true; continue; }
+    if (arg === "--yes") { options.yes = true; continue; }
+    if (["--model", "--level", "--effort", "--scope"].includes(arg)) {
+      const value = argv[++index];
+      if (!value || value.startsWith("--")) throw new Error(`${arg} requires a value.`);
+      if (arg === "--model") options.model = value;
+      if (arg === "--level") options.level = value;
+      if (arg === "--effort") options.effort = value;
+      if (arg === "--scope") options.scope = value;
+      continue;
+    }
+    throw new Error(`Unknown argument: ${arg}`);
+  }
+  if (options.help) return options;
+  if (!options.model) throw new Error("set-thinking requires --model <id>.");
+  if (!options.level) throw new Error("set-thinking requires --level <off|minimal|low|medium|high|xhigh>.");
+  if (!THINKING_LEVELS.includes(options.level)) {
+    throw new Error(`--level must be one of: ${THINKING_LEVELS.join(", ")}.`);
+  }
+  if (!options.effort) throw new Error("set-thinking requires --effort <value|clear>.");
+  if (!["user", "project"].includes(options.scope)) {
+    throw new Error('--scope must be either "user" or "project".');
+  }
+  return options;
+}
+
+function configDirFor(scope) {
+  return scope === "user" ? join(homedir(), ".pi", "agent") : join(process.cwd(), ".pi");
 }
 
 function normalizeBaseUrl(value) {
@@ -155,8 +214,76 @@ async function confirm(options) {
   }
 }
 
+async function runSetThinking(argv) {
+  const options = parseSetThinkingArgs(argv);
+  if (options.help) {
+    process.stdout.write(usage);
+    return;
+  }
+
+  const configDir = configDirFor(options.scope);
+  const modelsPath = join(configDir, "models.json");
+  const modelsConfig = readJson(modelsPath);
+
+  if (!modelsConfig.providers || typeof modelsConfig.providers !== "object" || Array.isArray(modelsConfig.providers)) {
+    modelsConfig.providers = {};
+  }
+  if (!modelsConfig.providers["ollama-mke"] || typeof modelsConfig.providers["ollama-mke"] !== "object") {
+    modelsConfig.providers["ollama-mke"] = {};
+  }
+  const provider = modelsConfig.providers["ollama-mke"];
+  if (!provider.modelOverrides || typeof provider.modelOverrides !== "object" || Array.isArray(provider.modelOverrides)) {
+    provider.modelOverrides = {};
+  }
+  if (!provider.modelOverrides[options.model] || typeof provider.modelOverrides[options.model] !== "object") {
+    provider.modelOverrides[options.model] = {};
+  }
+  const override = provider.modelOverrides[options.model];
+  if (!override.thinkingLevelMap || typeof override.thinkingLevelMap !== "object") {
+    override.thinkingLevelMap = {};
+  }
+
+  const clearing = options.effort === "clear";
+  const previous = Object.prototype.hasOwnProperty.call(override.thinkingLevelMap, options.level)
+    ? override.thinkingLevelMap[options.level]
+    : undefined;
+
+  console.log("\nPlanned change:");
+  console.log(`  ${modelsPath}`);
+  console.log(`  providers["ollama-mke"].modelOverrides["${options.model}"].thinkingLevelMap.${options.level}`);
+  console.log(
+    `    ${JSON.stringify(previous ?? null)} -> ${clearing ? "(removed, gateway decides again)" : JSON.stringify(options.effort)}`
+  );
+  console.log("\n  This is a per-level merge: every other thinking level for this model");
+  console.log("  (set by a prior override, or left to the gateway) is unaffected.");
+
+  if (!(await confirm(options))) {
+    console.log("No changes applied.");
+    return;
+  }
+
+  if (clearing) {
+    delete override.thinkingLevelMap[options.level];
+    if (Object.keys(override.thinkingLevelMap).length === 0) delete override.thinkingLevelMap;
+    if (Object.keys(override).length === 0) delete provider.modelOverrides[options.model];
+  } else {
+    override.thinkingLevelMap[options.level] = options.effort;
+  }
+
+  const backup = backupAndWrite(modelsPath, modelsConfig);
+  console.log(`\nWrote ${modelsPath}`);
+  if (backup) console.log(`Backup ${backup}`);
+  console.log("\nRestart Pi or run /reload for the change to take effect.");
+}
+
 async function main() {
-  const options = parseArgs(process.argv.slice(2));
+  const argv = process.argv.slice(2);
+  if (argv[0] === "set-thinking") {
+    await runSetThinking(argv.slice(1));
+    return;
+  }
+
+  const options = parseArgs(argv);
   if (options.help) {
     process.stdout.write(usage);
     return;
@@ -175,10 +302,7 @@ async function main() {
   for (const model of models.slice(0, 10)) console.log(`  - ${model.id}`);
   if (models.length > 10) console.log(`...and ${models.length - 10} more`);
 
-  const configDir =
-    options.scope === "user"
-      ? join(homedir(), ".pi", "agent")
-      : join(process.cwd(), ".pi");
+  const configDir = configDirFor(options.scope);
   const modelsPath = join(configDir, "models.json");
   const settingsPath = join(configDir, "settings.json");
   const modelsConfig = readJson(modelsPath);

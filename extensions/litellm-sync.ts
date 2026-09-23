@@ -428,7 +428,13 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
       id: m.id,
       name: displayName(m.id),
       reasoning: caps.reasoning,
-      thinkingLevelMap: override.thinkingLevelMap ?? caps.thinkingLevelMap,
+      // Per-level merge (not full replace): an override that sets only
+      // e.g. { off: "medium" } keeps the gateway-derived values for every
+      // other level instead of wiping them out.
+      thinkingLevelMap:
+        override.thinkingLevelMap || caps.thinkingLevelMap
+          ? { ...caps.thinkingLevelMap, ...override.thinkingLevelMap }
+          : undefined,
       input: ["text", "image"] as ["text", "image"],
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,

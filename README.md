@@ -141,6 +141,31 @@ The model-sync extension accepts per-model overrides at `providers["ollama-mke"]
 
 A gateway model id like `bedrock/claude-sonnet-4.6` already contains a `/` from LiteLLM's own routing — that is NOT the same as being prefixed with Pi's `ollama-mke` provider key. `/roles` and the sync extension both qualify it correctly as `ollama-mke/bedrock/claude-sonnet-4.6` when writing profiles, so `modelOverrides` keys should use the raw gateway id (as shown above), not the Pi-qualified one.
 
+#### Setting `thinkingLevelMap` from the command line: `set-thinking`
+
+Hand-editing `thinkingLevelMap` risks accidentally replacing the whole map for a model instead of changing one level. `bin/setup.mjs set-thinking` avoids that: it changes exactly one pi thinking level (`off`, `minimal`, `low`, `medium`, `high`, or `xhigh`) for one model, merging it into whatever `thinkingLevelMap` already exists (from a prior override or from the gateway) instead of overwriting the other levels.
+
+```sh
+# Make claude-opus-5-5 default to medium reasoning instead of off/none
+# (e.g. when a caller like pi-recap does not request an explicit level):
+node ~/.pi/agent/git/github.com/elmaxid/pi-litellm-ollama-mke/bin/setup.mjs \
+  set-thinking --model claude-opus-5-5 --level off --effort medium
+
+# Remove that override again and let the gateway decide for that level:
+node ~/.pi/agent/git/github.com/elmaxid/pi-litellm-ollama-mke/bin/setup.mjs \
+  set-thinking --model claude-opus-5-5 --level off --effort clear
+```
+
+| Flag | Description |
+| --- | --- |
+| `--model <id>` | Raw gateway model id (as returned by `/v1/models`), not the Pi-qualified `ollama-mke/<id>` form. |
+| `--level <lvl>` | Pi thinking level to change: `off`, `minimal`, `low`, `medium`, `high`, or `xhigh`. |
+| `--effort <value\|clear>` | Wire value LiteLLM expects for that level (e.g. `medium`, `none`), or `clear` to remove this level's override and let the gateway decide it again. |
+| `--scope <user\|project>` | Target user configuration or `.pi` configuration in the current project; defaults to `user`. |
+| `--yes` | Apply without a confirmation prompt. |
+
+It previews the exact `models.json` path and the before/after value, backs up `models.json` before writing (same `.bak-<timestamp>` convention as the main setup flow), and never touches any thinking level other than the one given. This file is user config the extension only reads, so a package update, `git pull`, or `/reload` never overwrites it — restart Pi or run `/reload` once after `set-thinking` so the running session picks up the new `models.json`.
+
 ### Role profile ownership
 
 `extensions/role-ownership.ts` adds a sidecar at `~/.pi/agent/gentle-ai/role-profiles.json` that records which `model_profiles` entries `/roles`' "Apply preset" last wrote (`managed`), versus profiles that already existed or were hand-edited since (`custom` / `stale-managed`). It never becomes the source of truth — `subagents.json` stays authoritative — and it never overwrites a profile it did not itself record writing.
