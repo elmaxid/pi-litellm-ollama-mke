@@ -100,8 +100,16 @@ interface GatewayCapabilities {
   reasoning: boolean;
   /** Present only when the gateway/override gave at least one concrete fact. */
   thinkingLevelMap?: Record<ThinkingLevel, string | null>;
-  /** True only when the gateway explicitly confirms at least one effort flag. */
-  supportsReasoningEffort: boolean;
+  /**
+   * `true` only when the gateway explicitly confirms at least one effort flag.
+   * `undefined` means "not confirmed" and is emitted as an omitted
+   * `compat.supportsReasoningEffort`, so pi's own auto-detected default
+   * applies. This extension never sets `false`: a silent gateway is not a
+   * denial, and switching the transport off turns every level pi offers into a
+   * no-op. Levels the gateway explicitly denies are expressed per level in
+   * `thinkingLevelMap` (null), which is what hides them from /thinking.
+   */
+  supportsReasoningEffort: boolean | undefined;
 }
 
 interface ProviderConfig {
@@ -216,7 +224,9 @@ const EFFORT_FLAG_BY_LEVEL: Record<Exclude<ThinkingLevel, "xhigh">, keyof LiteLL
  *   override), no map is produced — pi falls back to its own default mapping
  *   instead of us promising an untested xhigh/max level.
  * - `supportsReasoningEffort` is true only when at least one effort flag is
- *   explicitly true. It is never inferred from a model name.
+ *   explicitly true. It is never inferred from a model name, and it is never
+ *   set to false: an unconfirmed transport is omitted so pi's own default
+ *   applies, instead of silently discarding the level the user selected.
  */
 function gatewayCapabilities(
   heuristicReasoning: boolean,
@@ -228,7 +238,7 @@ function gatewayCapabilities(
   // Priority: explicit override > explicit gateway fact > heuristic hint.
   const reasoning = overrideReasoning ?? gatewayReasoning ?? heuristicReasoning;
 
-  if (!reasoning) return { reasoning: false, supportsReasoningEffort: false };
+  if (!reasoning) return { reasoning: false, supportsReasoningEffort: undefined };
 
   let anyEffortFlag = false;
   const map: Record<ThinkingLevel, string | null> = {
@@ -246,10 +256,16 @@ function gatewayCapabilities(
   }
   const xhighFlag = info?.supports_xhigh_reasoning_effort;
   const maxFlag = info?.supports_max_reasoning_effort;
-  if (xhighFlag === true || maxFlag === true) {
+  // An explicit denial always wins over silence on the sibling flag: only one
+  // of the two names is the same top level, so a denied `xhigh` (or a denied
+  // `max`) that is not offset by a confirmed `true` anywhere must not stay
+  // offered — that is the level the gateway just refused.
+  const xhighConfirmed = xhighFlag === true || maxFlag === true;
+  const xhighDenied = (xhighFlag === false || maxFlag === false) && !xhighConfirmed;
+  if (xhighConfirmed) {
     map.xhigh = maxFlag === true ? "max" : "xhigh";
     anyEffortFlag = true;
-  } else if (xhighFlag === false && maxFlag === false) {
+  } else if (xhighDenied) {
     map.xhigh = null;
   } else {
     // Neither confirmed nor denied by the gateway: do not claim xhigh support
@@ -266,7 +282,7 @@ function gatewayCapabilities(
   return {
     reasoning: true,
     thinkingLevelMap: hasFactualBasis ? map : undefined,
-    supportsReasoningEffort: anyEffortFlag,
+    supportsReasoningEffort: anyEffortFlag ? true : undefined,
   };
 }
 
@@ -400,6 +416,7 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
   let fromHeuristic = 0;
   let reasoningFromGateway = 0;
   const unresolved: string[] = [];
+  const unresolvedMaxTokens: string[] = [];
 
   const registered = models.map((m) => {
     const meta = modelMeta(m.id);
@@ -420,6 +437,13 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
       unresolved.push(m.id);
     }
 
+    // An output cap taken from the name heuristic is just as invented as a
+    // context window, and silently truncates long answers, so it is reported
+    // the same way instead of being absorbed by the fallback.
+    const maxTokensFromProvider =
+      override.maxTokens != null || m.max_output_tokens != null || info?.max_output_tokens != null;
+    if (!maxTokensFromProvider) unresolvedMaxTokens.push(m.id);
+
     // Capabilities: gateway-confirmed facts > explicit override > name heuristic.
     const caps = gatewayCapabilities(meta.reasoning, info, override);
     if (info?.supports_reasoning === true) reasoningFromGateway++;
@@ -439,12 +463,15 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
       cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
       contextWindow,
       maxTokens,
-      compat: {
-        // This gateway is a standard OpenAI-compatible LiteLLM proxy. We only
-        // set the flag it genuinely governs (reasoning_effort transport); we
-        // never invent a backend-specific thinkingFormat we have not verified.
-        supportsReasoningEffort: caps.supportsReasoningEffort,
-      },
+      // This gateway is a standard OpenAI-compatible LiteLLM proxy. We only
+      // set the flag it genuinely governs (reasoning_effort transport), and
+      // only from a confirmed gateway fact; we never invent a backend-specific
+      // thinkingFormat we have not verified. Omitting it on silence is
+      // deliberate: pi then applies its own default for this endpoint, so the
+      // level selected in /thinking actually reaches the gateway.
+      ...(caps.supportsReasoningEffort === undefined
+        ? {}
+        : { compat: { supportsReasoningEffort: caps.supportsReasoningEffort } }),
     };
   });
 
@@ -464,6 +491,13 @@ async function syncModels(pi: ExtensionAPI): Promise<void> {
     console.warn(
       `[ollama-mke-sync] No token limits advertised for: ${unresolved.join(", ")}. ` +
         `Using heuristic defaults — set providers["ollama-mke"].modelOverrides in models.json to correct them.`
+    );
+  }
+  if (unresolvedMaxTokens.length > 0) {
+    console.warn(
+      `[ollama-mke-sync] No max output tokens advertised for: ${unresolvedMaxTokens.join(", ")}. ` +
+        `Using the heuristic default — set providers["ollama-mke"].modelOverrides in models.json ` +
+        `(maxTokens) to correct them.`
     );
   }
 

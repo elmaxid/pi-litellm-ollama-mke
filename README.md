@@ -12,7 +12,7 @@ This lets a fresh development workstation go from “Pi installed” to “ollam
 
 ## Features
 
-- **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides. It also keeps `enabledModels` in `settings.json` from silently hiding new gateway models from `/model` and cycling — see [Seeing only some ollama-mke models in `/model`](#seeing-only-some-ollama-mke-models-in-model) below.
+- **Model Sync** — Fetches the live `/v1/models` list at startup and on `/reload`, then registers exact gateway model IDs under the `ollama-mke` provider. It uses advertised token limits where available and supports manual overrides; token limits it has to invent are reported at startup by model id ([below](#modeloverrides)). It also keeps `enabledModels` in `settings.json` from silently hiding new gateway models from `/model` and cycling — see [Seeing only some ollama-mke models in `/model`](#seeing-only-some-ollama-mke-models-in-model) below.
 - **Cost Tracking** — Uses the gateway's `x-litellm-response-cost` header or `/model/info` pricing to replace Pi's static cost calculation for `ollama-mke` requests.
 - **Session Grouping** — Adds `litellm_session_id` to outbound requests so calls from one Pi session are grouped in LiteLLM gateway logs.
 - **Role Config TUI (`/roles`)** — A visual, menu-driven editor for which model and thinking effort each agent role uses, with one-command presets backed by fixed model tiers.
@@ -83,6 +83,8 @@ What it can do:
 
 Capability facts come only from the gateway (`/model/info` `supports_reasoning` / `supports_*_reasoning_effort`) or an explicit `modelOverrides` entry — never from guessing off a model's name. A flag the gateway does not publish is treated as *unknown*, not as *supported*: `/roles` will not promise an effort level the backend never confirmed, and manually setting a role's effort is rejected (with an explanation) when the selected model's catalog entry explicitly denies that level or lacks confirmed reasoning.
 
+The reasoning-effort transport follows the same rule from the other side. `compat.supportsReasoningEffort` is only ever set to `true`, and only from a confirmed gateway flag; when the gateway stays silent the field is omitted, so Pi's own auto-detected default for the endpoint applies. The extension never sets it to `false`, because a silent gateway is not a denial — switching the transport off left `/thinking` offering `off`–`high` for a model that never received the selected level. Levels the gateway explicitly denies are expressed per level in `thinkingLevelMap` (`null`), which is what hides them from `/thinking` and `/roles`.
+
 Every write shows a summary first, creates a timestamped `subagents.json.bak-*` backup, and preserves any unknown keys already in the file. Changes apply to agents launched afterwards.
 
 #### Fixed model tiers
@@ -121,7 +123,6 @@ Deep roles always resolve to the tier's Claude-side id; standard and light roles
 ### `modelOverrides`
 
 The model-sync extension accepts per-model overrides at `providers["ollama-mke"].modelOverrides`. These have the highest precedence and are useful when gateway metadata does not advertise accurate token limits or reasoning support.
-
 ```json
 {
   "providers": {
@@ -140,6 +141,15 @@ The model-sync extension accepts per-model overrides at `providers["ollama-mke"]
 ```
 
 A gateway model id like `bedrock/claude-sonnet-4.6` already contains a `/` from LiteLLM's own routing — that is NOT the same as being prefixed with Pi's `ollama-mke` provider key. `/roles` and the sync extension both qualify it correctly as `ollama-mke/bedrock/claude-sonnet-4.6` when writing profiles, so `modelOverrides` keys should use the raw gateway id (as shown above), not the Pi-qualified one.
+
+#### Fallback token limits are reported, never silent
+
+When the gateway does not advertise a limit, the sync still has to register a usable number, so it falls back to a name-based heuristic (`contextWindow` 128000, `maxTokens` 16384 unless the id looks like a known Claude tier). Both fallbacks are printed at startup, naming every affected model, so an invented limit can never be mistaken for a published one:
+
+- `No token limits advertised for: …` — the context window came from the heuristic (the gateway published no `max_input_tokens` anywhere).
+- `No max output tokens advertised for: …` — the output cap came from the heuristic (the gateway published no `max_output_tokens`). This one silently truncates long answers, so it is worth fixing first: an output cap of 16384 on a model that really emits 32768–384000 tokens shows up as clipped or refused completions.
+
+Fix either by publishing the real values on the gateway model entry (`max_input_tokens` / `max_output_tokens` on LiteLLM's model, which the sync prefers automatically) or per model here with `modelOverrides` — the override wins over every gateway value.
 
 #### Setting `thinkingLevelMap` from the command line: `set-thinking`
 
